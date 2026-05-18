@@ -11,6 +11,9 @@ class RetrievalCandidate:
     text: str
     metadata: dict
     matched_terms: list[str]
+    modality: str = "text"
+    image_path: str = ""
+    image_name: str = ""
     snippet: str = ""
     bm25_score: float = 0.0
     vector_score: float = 0.0

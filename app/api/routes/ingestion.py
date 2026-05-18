@@ -1,6 +1,8 @@
 from fastapi import APIRouter, File, UploadFile
 
+from app.schemas.agentic import AgenticQueryRequest, AgenticQueryResponse
 from app.schemas.ingestion import IngestionResponse, QueryRequest, QueryResponse
+from app.services.agentic_orchestrator_service import run_agentic_query
 from app.services.ingestion_service import ingest_pdf
 from app.services.query_service import run_query_pipeline
 
@@ -15,3 +17,8 @@ async def ingest_pdf_endpoint(file: UploadFile = File(...)) -> IngestionResponse
 @router.post("/query", response_model=QueryResponse, response_model_exclude_none=True)
 async def query_chunks(payload: QueryRequest) -> QueryResponse:
     return await run_query_pipeline(payload)
+
+
+@router.post("/agentic/query", response_model=AgenticQueryResponse, response_model_exclude_none=True)
+async def agentic_query(payload: AgenticQueryRequest) -> AgenticQueryResponse:
+    return await run_agentic_query(payload)

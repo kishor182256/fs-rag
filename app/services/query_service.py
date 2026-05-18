@@ -25,6 +25,9 @@ async def run_query_pipeline(request: QueryRequest) -> QueryResponse:
                     topics=candidate.metadata.get("topics", []),
                     entities=candidate.metadata.get("entities", []),
                 ),
+                modality="image" if candidate.modality == "image" else "text",
+                image_path=candidate.image_path or None,
+                image_name=candidate.image_name or None,
                 text=candidate.text if include_text else None,
             )
         )

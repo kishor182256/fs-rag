@@ -27,6 +27,7 @@ class IngestionResponse(BaseModel):
     message: str
     months_detected: list[str] = Field(default_factory=list)
     topics_detected: list[str] = Field(default_factory=list)
+    vector_index_summary: dict = Field(default_factory=dict)
 
 
 class QueryRequest(BaseModel):
@@ -37,6 +38,7 @@ class QueryRequest(BaseModel):
     use_vector: bool = True
     vector_top_k: int = Field(default=8, ge=1, le=40)
     use_llm: bool = True
+    include_images: bool = False
     include_full_text: bool = False
     response_mode: Literal["compact", "balanced", "full"] = "balanced"
     max_snippet_chars: int = Field(default=1200, ge=120, le=4000)
@@ -52,6 +54,9 @@ class QueryHit(BaseModel):
     snippet: str
     matched_terms: list[str] = Field(default_factory=list)
     metadata: ChunkMetadata
+    modality: Literal["text", "image"] = "text"
+    image_path: str | None = None
+    image_name: str | None = None
     text: str | None = None
 
 

@@ -2,6 +2,8 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 
 class Settings(BaseSettings):
     app_name: str = "PDF Ingestion API"
@@ -19,15 +21,28 @@ class Settings(BaseSettings):
     upload_dir: Path = Path("data/uploads")
     processed_dir: Path = Path("data/processed")
     openai_api_key: str | None = None
-    openai_base_url: str = "http://localhost:11434/v1"
-    openai_model: str = "qwen2.5:7b"
-    embedding_model: str = "nomic-embed-text"
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4o-mini"
+    embedding_model: str = "text-embedding-3-small"
     llm_timeout_seconds: int = 30
     embedding_timeout_seconds: int = 30
+    enable_multimodal_ingest: bool = False
+    multimodal_qdrant_collection: str = "rag_chunks_mm"
+    multimodal_clip_qdrant_collection: str = "rag_chunks_mm_clip"
+    multimodal_max_images_per_doc: int = 80
+    multimodal_min_image_bytes: int = 1024
+    enable_clip_image_vectors: bool = False
+    clip_model_name: str = "ViT-B-32"
+    clip_pretrained: str = "laion2b_s34b_b79k"
+    enable_vlm_captions: bool = False
+    vlm_caption_model: str = "gpt-4o-mini"
+    vlm_caption_max_tokens: int = 80
 
     enable_vector_indexing: bool = True
+    qdrant_single_source: bool = True
     qdrant_host: str = "localhost"
     qdrant_port: int = 6333
+    qdrant_https: bool = False
     qdrant_api_key: str | None = None
     qdrant_collection: str = "rag_chunks"
     vector_distance: str = "cosine"
@@ -40,7 +55,7 @@ class Settings(BaseSettings):
     llm_max_context_hits: int = 3
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -51,5 +66,13 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def _resolve_storage_path(path_value: Path) -> Path:
+    return path_value if path_value.is_absolute() else (PROJECT_ROOT / path_value).resolve()
+
+
+settings.upload_dir = _resolve_storage_path(settings.upload_dir)
+settings.processed_dir = _resolve_storage_path(settings.processed_dir)
 settings.upload_dir.mkdir(parents=True, exist_ok=True)
 settings.processed_dir.mkdir(parents=True, exist_ok=True)
