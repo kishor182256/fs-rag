@@ -1,0 +1,18 @@
+{
+  "created_at_utc": "2026-05-18T05:57:05.175180+00:00",
+  "records_file": "datasets\\eval_records.jsonl",
+  "num_records_used": 10,
+  "llm_model": "qwen2.5:1.5b",
+  "embedding_model": "qwen3-embedding:0.6b",
+  "limit": 10,
+  "max_workers": 1,
+  "timeout_seconds": 900,
+  "max_retries": 1,
+  "batch_size": 1,
+  "scores": {},
+  "metrics_used": [
+    "faithfulness",
+    "context_precision",
+    "context_recall"
+  ]
+}

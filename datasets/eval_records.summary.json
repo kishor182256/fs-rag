@@ -1,0 +1,12 @@
+{
+  "created_at_utc": "2026-05-17T14:37:17.456611+00:00",
+  "input_gold_rows": 150,
+  "records_written": 150,
+  "failures": 0,
+  "query_url": "http://localhost:8000/v1/query",
+  "top_k": 5,
+  "use_llm": false,
+  "use_vector": true,
+  "output_file": "datasets\\eval_records.jsonl",
+  "error_samples": []
+}
