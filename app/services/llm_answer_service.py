@@ -1,4 +1,5 @@
-import json
+﻿import json
+import re
 
 import httpx
 
@@ -42,22 +43,82 @@ def _build_context(hits: list[QueryHit]) -> str:
     return "\n\n".join(context_blocks)
 
 
+def _length_hint(query: str) -> str:
+    range_match = re.search(r"\b(\d{1,2})\s*[\-\u2013]\s*(\d{1,2})\s*lines?\b", query.lower())
+    if range_match:
+        lo = int(range_match.group(1))
+        hi = int(range_match.group(2))
+        if 1 <= lo <= hi <= 60:
+            return f"Length constraint: keep the answer between {lo} and {hi} lines."
+
+    fixed_match = re.search(r"\b(\d{1,2})\s*lines?\b", query.lower())
+    if fixed_match:
+        value = int(fixed_match.group(1))
+        if 1 <= value <= 60:
+            return f"Length constraint: keep the answer around {value} lines."
+
+    return ""
+
+
+def _response_style_hint(query: str) -> str:
+    lowered = query.lower()
+    list_only_markers = ["give list", "list of", "table of", "winners list"]
+    explanatory_markers = [
+        "explain",
+        "describe",
+        "overview",
+        "how",
+        "why",
+        "analysis",
+        "impact",
+        "key highlights",
+        "highlights of",
+    ]
+    is_list_only = any(marker in lowered for marker in list_only_markers) and not any(
+        marker in lowered for marker in ["explain", "describe", "overview", "analysis"]
+    )
+    is_explanatory = any(marker in lowered for marker in explanatory_markers)
+
+    if is_list_only:
+        return (
+            "Output format: return only the requested list, with no intro or conclusion. "
+            "Keep each bullet factual and concise."
+        )
+
+    if is_explanatory:
+        return (
+            "Output format: provide three parts in plain text labels: Basic Info, Detailed Insights, Conclusion. "
+            "Basic Info should give 2-4 concise bullets. "
+            "Detailed Insights should give 3-6 richer points from evidence. "
+            "Conclusion should summarize significance in 2-3 sentences."
+        )
+
+    return "Output format: start with a short direct answer, then supporting points, then a brief conclusion."
+
+
 async def synthesize_answer(query: str, hits: list[QueryHit]) -> tuple[str | None, str, str | None]:
     if not hits:
         return "No relevant information found in retrieved context.", "no_hits", None
 
+    length_hint = _length_hint(query)
+    style_hint = _response_style_hint(query)
     instructions = (
-        "You are a strict RAG answer engine. "
+        "You are a strict production RAG answer engine. "
         "Answer only from provided context. "
-        "Return only what the user asked; do not include unrelated sections. "
-        "If the user asks for a list, return only that list. "
-        "Do not add external facts. "
-        "Keep response concise and high-signal. "
-        "Cite each line using (chunk_id pX-Y)."
+        "Never add external facts, assumptions, or guessed details. "
+        "If evidence is weak or conflicting, state 'Insufficient local evidence.' "
+        "Return only what the user asked and avoid unrelated details. "
+        "Use plain text output and avoid markdown headings. "
+        "For list/highlights queries, return a clean bullet list. "
+        "Cite every bullet or sentence with (chunk_id pX-Y). "
+        "Do not include citations that are not used in the answer. "
+        f"{style_hint}"
     )
 
+    length_line = f"{length_hint}\n\n" if length_hint else ""
     user_prompt = (
         f"User query: {query}\n\n"
+        f"{length_line}"
         "Retrieved context follows.\n"
         "Use it to produce the final answer.\n\n"
         f"{_build_context(hits)}"

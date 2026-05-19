@@ -1,8 +1,12 @@
+import re
+
 from app.schemas.agentic import (
     AgentStep,
     AgenticQueryRequest,
     AgenticQueryResponse,
     EvidenceItem,
+    ResponseMetadata,
+    ResponseSource,
 )
 from app.services.agents.critic_agent import evaluate_answer
 from app.services.agents.planner_agent import build_plan
@@ -52,6 +56,75 @@ def _append_steps(steps: list[AgentStep], step: str, status: str, detail: str) -
     steps.append(AgentStep(step=step, status=status, detail=detail))
 
 
+def _citations_for_response(answer: str, evidence: list[EvidenceItem], limit: int) -> list[str]:
+    cited_ids = re.findall(r"\((chunk_[A-Za-z0-9_-]+\s+p\d+-\d+)\)", answer or "")
+    if cited_ids:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for cited in cited_ids:
+            marker = f"({cited})"
+            if marker not in seen:
+                unique.append(marker)
+                seen.add(marker)
+        return unique[: max(1, limit)]
+
+    return [e.citation for e in evidence[:limit]]
+
+
+def _guardrail_fallback_answer(query: str, candidates: list[RetrievalCandidate], max_lines: int = 5) -> str:
+    if not candidates:
+        return "Insufficient local evidence."
+
+    lines: list[str] = [f"Query: {query}"]
+    for candidate in candidates[:max(1, max_lines)]:
+        snippet = re.sub(r"\s+", " ", (candidate.snippet or candidate.text)).strip()
+        if len(snippet) > 260:
+            snippet = snippet[:257] + "..."
+        lines.append(f"- {snippet} ({candidate.chunk_id} p{candidate.page_start}-{candidate.page_end})")
+    return "\n".join(lines)
+
+
+def _build_sources(evidence: list[EvidenceItem], limit: int) -> list[ResponseSource]:
+    sources: list[ResponseSource] = []
+    seen: set[str] = set()
+    for item in evidence[: max(1, limit)]:
+        pages = (
+            str(item.page_start)
+            if item.page_start == item.page_end
+            else f"{item.page_start}-{item.page_end}"
+        )
+        key = f"{item.source_file}::{pages}"
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append(ResponseSource(document=item.source_file, pages=pages))
+    return sources
+
+
+def _retrieval_method(use_vector: bool, vector_status: str) -> str:
+    if use_vector and vector_status == "used":
+        return "hybrid_vector_bm25"
+    if use_vector and vector_status in {"unavailable", "error"}:
+        return "bm25_fallback"
+    if use_vector:
+        return "vector_requested"
+    return "bm25"
+
+
+def _response_metadata(
+    *,
+    model: str | None,
+    use_vector: bool,
+    vector_status: str,
+    grounded: bool,
+) -> ResponseMetadata:
+    return ResponseMetadata(
+        model=model,
+        retrieval_method=_retrieval_method(use_vector=use_vector, vector_status=vector_status),
+        grounded=grounded,
+    )
+
+
 async def run_agentic_query(request: AgenticQueryRequest) -> AgenticQueryResponse:
     steps: list[AgentStep] = []
     include_debug, include_evidence, include_steps = _mode_flags(request.response_mode)
@@ -62,7 +135,14 @@ async def run_agentic_query(request: AgenticQueryRequest) -> AgenticQueryRespons
         return AgenticQueryResponse(
             query=request.query,
             status="blocked",
+            answer="Query blocked by security guardrails.",
             final_answer="Query blocked by security guardrails.",
+            metadata=_response_metadata(
+                model=None,
+                use_vector=request.use_vector,
+                vector_status="disabled",
+                grounded=False,
+            ),
             input_guardrails=input_guardrails if include_debug else None,
             steps=steps if include_steps else None,
         )
@@ -79,10 +159,18 @@ async def run_agentic_query(request: AgenticQueryRequest) -> AgenticQueryRespons
         return AgenticQueryResponse(
             query=request.query,
             status="abstained",
+            answer="Insufficient trusted evidence after retrieval guardrails.",
             final_answer="Insufficient trusted evidence after retrieval guardrails.",
             planner=plan if include_debug else None,
             input_guardrails=input_guardrails if include_debug else None,
             retrieval_guardrails=retrieval_report if include_debug else None,
+            sources=[],
+            metadata=_response_metadata(
+                model=None,
+                use_vector=request.use_vector,
+                vector_status=vector_status,
+                grounded=False,
+            ),
             steps=steps if include_steps else None,
             vector_status=vector_status,
         )
@@ -126,36 +214,107 @@ async def run_agentic_query(request: AgenticQueryRequest) -> AgenticQueryRespons
 
     output_ok, output_issues = enforce_output_guardrails(answer, require_citations=request.require_citations)
     if not output_ok:
-        _append_steps(steps, "output_guardrails", "blocked", f"Output blocked: {', '.join(output_issues)}")
-        return AgenticQueryResponse(
-            query=request.query,
-            status="blocked",
-            final_answer="Answer blocked by output guardrails.",
-            planner=plan if include_debug else None,
-            input_guardrails=input_guardrails if include_debug else None,
-            retrieval_guardrails=retrieval_report if include_debug else None,
-            critic=critic if include_debug else None,
-            evidence=evidence if include_evidence else None,
-            citations=[e.citation for e in evidence[: request.top_k]],
-            steps=steps if include_steps else None,
-            answer_model=answer_model,
-            vector_status=vector_status,
-        )
+        if "unsafe_content_detected" not in output_issues:
+            fallback_answer = _guardrail_fallback_answer(
+                query=working_request.query,
+                candidates=guarded_candidates,
+                max_lines=min(request.top_k, 6),
+            )
+            fallback_ok, fallback_issues = enforce_output_guardrails(
+                fallback_answer,
+                require_citations=request.require_citations,
+            )
+            if fallback_ok:
+                answer = fallback_answer
+                answer_model = answer_model or "deterministic_fallback"
+                critic = evaluate_answer(
+                    answer=answer,
+                    candidates=guarded_candidates,
+                    require_citations=request.require_citations,
+                )
+                _append_steps(
+                    steps,
+                    "output_guardrails",
+                    "warn",
+                    f"Applied citation-safe fallback due to: {', '.join(output_issues)}",
+                )
+            else:
+                _append_steps(
+                    steps,
+                    "output_guardrails",
+                    "blocked",
+                    f"Output blocked after fallback: {', '.join(fallback_issues)}",
+                )
+                return AgenticQueryResponse(
+                    query=request.query,
+                    status="blocked",
+                    answer="Answer blocked by output guardrails.",
+                    final_answer="Answer blocked by output guardrails.",
+                    planner=plan if include_debug else None,
+                    input_guardrails=input_guardrails if include_debug else None,
+                    retrieval_guardrails=retrieval_report if include_debug else None,
+                    critic=critic if include_debug else None,
+                    evidence=evidence if include_evidence else None,
+                    sources=_build_sources(evidence, request.top_k),
+                    metadata=_response_metadata(
+                        model=answer_model,
+                        use_vector=request.use_vector,
+                        vector_status=vector_status,
+                        grounded=False,
+                    ),
+                    citations=_citations_for_response(answer, evidence, request.top_k),
+                    steps=steps if include_steps else None,
+                    answer_model=answer_model,
+                    vector_status=vector_status,
+                )
+        else:
+            _append_steps(steps, "output_guardrails", "blocked", f"Output blocked: {', '.join(output_issues)}")
+            return AgenticQueryResponse(
+                query=request.query,
+                status="blocked",
+                answer="Answer blocked by output guardrails.",
+                final_answer="Answer blocked by output guardrails.",
+                planner=plan if include_debug else None,
+                input_guardrails=input_guardrails if include_debug else None,
+                retrieval_guardrails=retrieval_report if include_debug else None,
+                critic=critic if include_debug else None,
+                evidence=evidence if include_evidence else None,
+                sources=_build_sources(evidence, request.top_k),
+                metadata=_response_metadata(
+                    model=answer_model,
+                    use_vector=request.use_vector,
+                    vector_status=vector_status,
+                    grounded=False,
+                ),
+                citations=_citations_for_response(answer, evidence, request.top_k),
+                steps=steps if include_steps else None,
+                answer_model=answer_model,
+                vector_status=vector_status,
+            )
 
-    _append_steps(steps, "output_guardrails", "ok", "Output passed safety and citation checks.")
+    if output_ok:
+        _append_steps(steps, "output_guardrails", "ok", "Output passed safety and citation checks.")
 
     if not critic.passed:
         _append_steps(steps, "critic_agent", "warn", "Critic did not pass after correction budget.")
         return AgenticQueryResponse(
             query=request.query,
             status="abstained",
+            answer="Insufficient confidence to provide a final answer.",
             final_answer="Insufficient confidence to provide a final answer.",
             planner=plan if include_debug else None,
             input_guardrails=input_guardrails if include_debug else None,
             retrieval_guardrails=retrieval_report if include_debug else None,
             critic=critic if include_debug else None,
             evidence=evidence if include_evidence else None,
-            citations=[e.citation for e in evidence[: request.top_k]],
+            sources=_build_sources(evidence, request.top_k),
+            metadata=_response_metadata(
+                model=answer_model,
+                use_vector=request.use_vector,
+                vector_status=vector_status,
+                grounded=False,
+            ),
+            citations=_citations_for_response(answer, evidence, request.top_k),
             steps=steps if include_steps else None,
             answer_model=answer_model,
             vector_status=vector_status,
@@ -165,13 +324,21 @@ async def run_agentic_query(request: AgenticQueryRequest) -> AgenticQueryRespons
     return AgenticQueryResponse(
         query=request.query,
         status="completed",
+        answer=answer,
         final_answer=answer,
         planner=plan if include_debug else None,
         input_guardrails=input_guardrails if include_debug else None,
         retrieval_guardrails=retrieval_report if include_debug else None,
         critic=critic if include_debug else None,
         evidence=evidence if include_evidence else None,
-        citations=[e.citation for e in evidence[: request.top_k]],
+        sources=_build_sources(evidence, request.top_k),
+        metadata=_response_metadata(
+            model=answer_model,
+            use_vector=request.use_vector,
+            vector_status=vector_status,
+            grounded=bool(critic.passed),
+        ),
+        citations=_citations_for_response(answer, evidence, request.top_k),
         steps=steps if include_steps else None,
         answer_model=answer_model,
         vector_status=vector_status,

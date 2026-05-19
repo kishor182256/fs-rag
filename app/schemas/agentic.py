@@ -67,10 +67,24 @@ class AgentStep(BaseModel):
     detail: str
 
 
+class ResponseSource(BaseModel):
+    document: str
+    pages: str
+
+
+class ResponseMetadata(BaseModel):
+    model: str | None = None
+    retrieval_method: str = "unknown"
+    grounded: bool = False
+
+
 class AgenticQueryResponse(BaseModel):
     query: str
     status: Literal["completed", "blocked", "abstained", "failed"]
+    answer: str | None = None
     final_answer: str | None = None
+    sources: list[ResponseSource] = Field(default_factory=list)
+    metadata: ResponseMetadata | None = None
     citations: list[str] = Field(default_factory=list)
     planner: AgentPlan | None = None
     input_guardrails: GuardrailResult | None = None

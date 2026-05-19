@@ -2,9 +2,10 @@ import re
 
 
 UNSAFE_PATTERNS = [
-    r"\bkill\b",
-    r"\battack\b",
-    r"\bhate\b",
+    r"\b(how to|ways? to|guide to|steps to)\s+(kill|attack)\b",
+    r"\b(i want to|i will|let's)\s+(kill|attack)\b",
+    r"\b(kill|attack)\s+(someone|somebody|person|people|him|her|them)\b",
+    r"\bhate\s+(speech|crime|group|community|people)\b",
 ]
 
 
@@ -14,7 +15,7 @@ def enforce_output_guardrails(
     require_citations: bool,
 ) -> tuple[bool, list[str]]:
     issues: list[str] = []
-    lowered = answer.lower()
+    lowered = (answer or "").lower()
     for pattern in UNSAFE_PATTERNS:
         if re.search(pattern, lowered):
             issues.append("unsafe_content_detected")

@@ -1,3 +1,5 @@
+import re
+
 from app.core.config import settings
 from app.schemas.ingestion import QueryRequest
 from app.services.bm25_service import search_bm25
@@ -8,6 +10,43 @@ from app.services.vector_store_service import (
     search_chunks_semantic,
     search_images_semantic,
 )
+
+TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-']*")
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "was",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "with",
+}
+
+
+def _query_keywords(query: str) -> list[str]:
+    tokens = [token for token in TOKEN_PATTERN.findall(query.lower()) if len(token) > 1]
+    keywords = [token for token in tokens if token not in STOPWORDS]
+    return keywords or tokens
 
 
 def _compute_matched_terms(query: str, text: str) -> list[str]:
@@ -69,6 +108,54 @@ def _merge_candidates(
     return list(merged.values())
 
 
+def _post_filter_candidates(candidates: list[RetrievalCandidate], request: QueryRequest) -> list[RetrievalCandidate]:
+    if not candidates:
+        return []
+
+    query_terms = set(_query_keywords(request.query))
+    top_score = max(candidates[0].rerank_score, 1e-6)
+    coverage_threshold = settings.search_min_keyword_coverage
+    if len(query_terms) >= 8:
+        coverage_threshold = min(coverage_threshold, 0.25)
+    if len(query_terms) >= 12:
+        coverage_threshold = min(coverage_threshold, 0.20)
+
+    kept: list[RetrievalCandidate] = []
+    seen_ids: set[str] = set()
+    seen_signatures: set[str] = set()
+
+    for candidate in candidates:
+        candidate_key = f"{candidate.doc_id}::{candidate.chunk_id}::{candidate.modality}"
+        if candidate_key in seen_ids:
+            continue
+        seen_ids.add(candidate_key)
+
+        signature = re.sub(r"\s+", " ", candidate.text.lower()).strip()[:280]
+        if signature and signature in seen_signatures:
+            continue
+        if signature:
+            seen_signatures.add(signature)
+
+        matched = {term.lower() for term in candidate.matched_terms}
+        lexical_coverage = (len(matched & query_terms) / len(query_terms)) if query_terms else 1.0
+        relative_score = candidate.rerank_score / top_score
+
+        strong_anchor = (
+            candidate.rerank_score >= max(0.8, top_score * 0.90)
+            or bool(set(re.findall(r"\b[A-Z]{2,}\b", request.query)) & set(re.findall(r"\b[A-Z]{2,}\b", candidate.text)))
+        )
+        passes_quality_gate = (
+            candidate.rerank_score >= settings.search_min_score
+            and relative_score >= settings.search_relative_score_ratio
+            and (lexical_coverage >= coverage_threshold or strong_anchor)
+        )
+
+        if passes_quality_gate or not kept:
+            kept.append(candidate)
+
+    return kept
+
+
 async def run_hybrid_retrieval(request: QueryRequest) -> tuple[list[RetrievalCandidate], str]:
     chunks = load_text_chunks_for_bm25(limit=5000)
     bm25_candidates: list[RetrievalCandidate] = []
@@ -109,4 +196,5 @@ async def run_hybrid_retrieval(request: QueryRequest) -> tuple[list[RetrievalCan
     if not merged:
         return [], vector_status
     reranked = rerank_candidates(query=request.query, candidates=merged, request=request)
-    return reranked[: request.top_k], vector_status
+    filtered = _post_filter_candidates(reranked, request)
+    return filtered[: request.top_k], vector_status
