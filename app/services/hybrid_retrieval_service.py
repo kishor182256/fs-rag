@@ -1,39 +1,13 @@
-import json
-
 from app.core.config import settings
 from app.schemas.ingestion import QueryRequest
 from app.services.bm25_service import search_bm25
 from app.services.reranker_service import rerank_candidates
 from app.services.retrieval_types import RetrievalCandidate
-from app.services.vector_store_service import search_chunks_semantic, search_images_semantic
-
-
-def _load_chunk_records() -> list[dict]:
-    manifests = sorted(settings.processed_dir.glob("*.json"))
-    records: list[dict] = []
-
-    for manifest_path in manifests:
-        try:
-            doc = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            continue
-
-        doc_id = str(doc.get("doc_id", ""))
-        source_file = str(doc.get("source_file", ""))
-        for chunk in doc.get("chunks", []):
-            records.append(
-                {
-                    "doc_id": doc_id,
-                    "source_file": source_file,
-                    "chunk_id": str(chunk.get("chunk_id", "")),
-                    "page_start": int(chunk.get("page_start", 0) or 0),
-                    "page_end": int(chunk.get("page_end", 0) or 0),
-                    "text": str(chunk.get("text", "")),
-                    "metadata": chunk.get("metadata", {}) if isinstance(chunk.get("metadata", {}), dict) else {},
-                }
-            )
-
-    return records
+from app.services.vector_store_service import (
+    load_text_chunks_for_bm25,
+    search_chunks_semantic,
+    search_images_semantic,
+)
 
 
 def _compute_matched_terms(query: str, text: str) -> list[str]:
@@ -96,17 +70,16 @@ def _merge_candidates(
 
 
 async def run_hybrid_retrieval(request: QueryRequest) -> tuple[list[RetrievalCandidate], str]:
+    chunks = load_text_chunks_for_bm25(limit=5000)
     bm25_candidates: list[RetrievalCandidate] = []
-    if not settings.qdrant_single_source:
-        chunks = _load_chunk_records()
-        if chunks:
-            bm25_candidates = search_bm25(
-                chunks=chunks,
-                request=request,
-                bm25_k1=settings.bm25_k1,
-                bm25_b=settings.bm25_b,
-                limit=max(request.top_k * 4, 20),
-            )
+    if chunks:
+        bm25_candidates = search_bm25(
+            chunks=chunks,
+            request=request,
+            bm25_k1=settings.bm25_k1,
+            bm25_b=settings.bm25_b,
+            limit=max(request.top_k * 4, 20),
+        )
 
     vector_status = "disabled"
     vector_candidates = []
@@ -127,9 +100,6 @@ async def run_hybrid_retrieval(request: QueryRequest) -> tuple[list[RetrievalCan
                 vector_status = "error"
             elif vector_status == "unavailable" or image_vector_status == "unavailable":
                 vector_status = "unavailable"
-
-    if settings.qdrant_single_source and not vector_candidates:
-        return [], vector_status
 
     merged = _merge_candidates(
         bm25_candidates=bm25_candidates,

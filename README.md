@@ -4,7 +4,7 @@ Starter implementation for ingesting exam-style PDF documents.
 
 ## What this includes
 - `POST /v1/ingest/pdf`: upload PDF and ingest text chunks
-- `POST /v1/query`: retrieve top matching chunks from ingested manifests
+- `POST /v1/query`: retrieve top matching chunks from Qdrant
 - `POST /v1/agentic/query`: planner/retriever/synthesizer/critic orchestration with guardrails
 - `GET /health`: health check
 - PDF extraction with `pypdf`
@@ -13,7 +13,7 @@ Starter implementation for ingesting exam-style PDF documents.
 - Automatic metadata enrichment (months/topics/entities)
 - True hybrid retrieval: BM25 + vector + reranker
 - Embeddings + local Qdrant vector indexing (during ingestion)
-- Local manifest output under `data/processed/<doc_id>.json`
+- Qdrant is the single retrieval source for ingested chunks
 
 ## Quick start
 1. Create virtual env and activate it.
@@ -83,7 +83,7 @@ LLM answer synthesis at end of `/v1/query`:
 Vector setup (local):
 - Run Qdrant locally on port `6333`.
 - Ensure embedding endpoint is available at `${OPENAI_BASE_URL}/embeddings` for `EMBEDDING_MODEL` (default `text-embedding-3-small`).
-- Ingestion writes `vector_index_summary` into each document manifest.
+- Ingestion writes `vector_index_summary` in API response and indexes chunks into Qdrant.
 - Hybrid knobs:
   - `BM25_K1`, `BM25_B`
   - `VECTOR_QUERY_LIMIT`

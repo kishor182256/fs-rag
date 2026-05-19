@@ -19,7 +19,6 @@ class Settings(BaseSettings):
     enable_ocr_fallback: bool = False
 
     upload_dir: Path = Path("data/uploads")
-    processed_dir: Path = Path("data/processed")
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
@@ -73,6 +72,4 @@ def _resolve_storage_path(path_value: Path) -> Path:
 
 
 settings.upload_dir = _resolve_storage_path(settings.upload_dir)
-settings.processed_dir = _resolve_storage_path(settings.processed_dir)
 settings.upload_dir.mkdir(parents=True, exist_ok=True)
-settings.processed_dir.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,4 @@
-from datetime import UTC, datetime
 import hashlib
-import json
 from pathlib import Path
 import uuid
 
@@ -13,7 +11,11 @@ from app.services.chunker import build_chunks
 from app.services.metadata_enricher import extract_metadata
 from app.services.multimodal_service import generate_vlm_caption
 from app.services.pdf_extractor import extract_pdf_pages
-from app.services.vector_store_service import index_chunks, index_multimodal_image_records
+from app.services.vector_store_service import (
+    find_duplicate_by_file_hash,
+    index_chunks,
+    index_multimodal_image_records,
+)
 
 
 def _safe_filename(name: str) -> str:
@@ -42,60 +44,11 @@ async def _save_upload(file: UploadFile, destination: Path) -> tuple[int, str]:
     return total_size, hasher.hexdigest()
 
 
-def _sha256_of_file(file_path: Path) -> str | None:
-    if not file_path.exists() or not file_path.is_file():
-        return None
-    hasher = hashlib.sha256()
-    with file_path.open("rb") as in_file:
-        while True:
-            chunk = in_file.read(1024 * 1024)
-            if not chunk:
-                break
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def _find_duplicate_manifest(file_sha256: str) -> dict | None:
-    normalized_hash = str(file_sha256 or "").strip().lower()
-    if not normalized_hash:
-        return None
-
-    settings.processed_dir.mkdir(parents=True, exist_ok=True)
-    for manifest_path in settings.processed_dir.glob("*.json"):
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-
-        manifest_hash = str(manifest.get("file_sha256", "")).strip().lower()
-        if not manifest_hash:
-            stored_file = str(manifest.get("stored_file", "")).strip()
-            if stored_file:
-                computed_hash = _sha256_of_file(Path(stored_file))
-                if computed_hash:
-                    manifest_hash = computed_hash.lower()
-                    manifest["file_sha256"] = manifest_hash
-                    try:
-                        manifest_path.write_text(json.dumps(manifest, ensure_ascii=True, indent=2), encoding="utf-8")
-                    except Exception:
-                        pass
-
-        if manifest_hash and manifest_hash == normalized_hash:
-            return {
-                "doc_id": str(manifest.get("doc_id", "")),
-                "source_file": str(manifest.get("source_file", "")),
-                "manifest_path": str(manifest_path),
-                "stored_file": str(manifest.get("stored_file", "")),
-            }
-
-    return None
-
-
 async def _extract_pdf_image_records(file_path: Path, doc_id: str, source_file: str) -> tuple[list[dict], dict]:
     if not settings.enable_multimodal_ingest:
         return [], {"status": "disabled", "images_extracted": 0}
 
-    images_root = settings.processed_dir / "images" / doc_id
+    images_root = settings.upload_dir / "images" / doc_id
     images_root.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -181,7 +134,7 @@ async def ingest_pdf(file: UploadFile) -> IngestionResponse:
 
     file_size, file_sha256 = await _save_upload(file, destination)
 
-    duplicate = _find_duplicate_manifest(file_sha256)
+    duplicate = find_duplicate_by_file_hash(file_sha256)
     if duplicate is not None:
         destination.unlink(missing_ok=True)
         raise HTTPException(
@@ -192,7 +145,6 @@ async def ingest_pdf(file: UploadFile) -> IngestionResponse:
                 "file_sha256": file_sha256,
                 "existing_doc_id": duplicate.get("doc_id", ""),
                 "existing_source_file": duplicate.get("source_file", ""),
-                "existing_manifest_path": duplicate.get("manifest_path", ""),
             },
         )
 
@@ -248,32 +200,12 @@ async def ingest_pdf(file: UploadFile) -> IngestionResponse:
             }
         )
 
-    manifest = {
-        "doc_id": doc_id,
-        "source_file": original_name,
-        "stored_file": str(destination),
-        "file_sha256": file_sha256,
-        "created_at_utc": datetime.now(UTC).isoformat(),
-        "file_size_bytes": file_size,
-        "pages_processed": len(pages),
-        "chunks_created": len(chunks),
-        "extraction_summary": {
-            "methods": extraction_methods,
-            "likely_scanned_pages": likely_scanned_pages,
-        },
-        "doc_metadata": {
-            "months": sorted(doc_months),
-            "topics": sorted(doc_topics),
-        },
-        "chunks": chunk_records,
-    }
-
     vector_index_summary = await index_chunks(
         doc_id=doc_id,
         source_file=original_name,
         chunks=chunk_records,
+        file_sha256=file_sha256,
     )
-    manifest["vector_index_summary"] = vector_index_summary
 
     image_records, image_extraction_summary = await _extract_pdf_image_records(
         file_path=destination,
@@ -285,23 +217,23 @@ async def ingest_pdf(file: UploadFile) -> IngestionResponse:
         source_file=original_name,
         image_records=image_records,
     )
-    manifest["multimodal_extraction_summary"] = image_extraction_summary
-    manifest["multimodal_vector_index_summary"] = multimodal_index_summary
-    manifest["images"] = image_records
-
-    manifest_path = settings.processed_dir / f"{doc_id}.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=True, indent=2), encoding="utf-8")
-
     return IngestionResponse(
         doc_id=doc_id,
         source_file=original_name,
         file_size_bytes=file_size,
         pages_processed=len(pages),
         chunks_created=len(chunks),
-        manifest_path=str(manifest_path),
-        message="Ingestion completed.",
+        manifest_path=f"qdrant://{settings.qdrant_collection}/{doc_id}",
+        message="Ingestion completed into Qdrant only.",
         months_detected=sorted(doc_months),
         topics_detected=sorted(doc_topics),
-        vector_index_summary=vector_index_summary,
+        vector_index_summary={
+            **vector_index_summary,
+            "extraction_summary": {
+                "methods": extraction_methods,
+                "likely_scanned_pages": likely_scanned_pages,
+            },
+            "multimodal_extraction_summary": image_extraction_summary,
+            "multimodal_vector_index_summary": multimodal_index_summary,
+        },
     )

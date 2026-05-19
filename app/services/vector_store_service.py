@@ -507,3 +507,60 @@ async def search_images_semantic(query: str, limit: int) -> tuple[list[VectorSea
 
     hits = sorted(merged.values(), key=lambda item: item.score, reverse=True)[:limit]
     return hits, "used"
+
+
+def load_text_chunks_for_bm25(limit: int = 5000) -> list[dict]:
+    if not settings.enable_vector_indexing:
+        return []
+
+    try:
+        client = _client()
+    except VectorStoreUnavailableError:
+        return []
+
+    if not _collection_exists(client, settings.qdrant_collection):
+        return []
+
+    rows: list[dict] = []
+    offset = None
+    page_size = 256
+
+    while len(rows) < limit:
+        try:
+            points, next_offset = client.scroll(
+                collection_name=settings.qdrant_collection,
+                limit=min(page_size, limit - len(rows)),
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception:
+            break
+
+        if not points:
+            break
+
+        for point in points:
+            payload = point.payload or {}
+            text = str(payload.get("text", "")).strip()
+            if not text:
+                continue
+            rows.append(
+                {
+                    "doc_id": str(payload.get("doc_id", "")),
+                    "source_file": str(payload.get("source_file", "")),
+                    "chunk_id": str(payload.get("chunk_id", "")),
+                    "page_start": int(payload.get("page_start", 0) or 0),
+                    "page_end": int(payload.get("page_end", 0) or 0),
+                    "text": text,
+                    "metadata": payload.get("metadata", {}) if isinstance(payload.get("metadata", {}), dict) else {},
+                }
+            )
+            if len(rows) >= limit:
+                break
+
+        if next_offset is None:
+            break
+        offset = next_offset
+
+    return rows
