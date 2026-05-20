@@ -1,9 +1,10 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-pydantic==2.10.4
-pydantic-settings==2.7.0
+pydantic==2.11.7
+pydantic-settings==2.10.1
 python-multipart==0.0.20
 pypdf==5.1.0
 pytest==8.3.4
 httpx==0.28.1
-qdrant-client==1.12.1
+qdrant-client==1.15.1
+sentence-transformers==3.4.1

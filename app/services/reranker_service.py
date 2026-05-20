@@ -1,6 +1,8 @@
 import re
 
+from app.core.config import settings
 from app.schemas.ingestion import QueryRequest
+from app.services.hf_reranker_service import score_hf_reranker
 from app.services.retrieval_types import RetrievalCandidate
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-']*")
@@ -217,6 +219,21 @@ def rerank_candidates(
         candidate_snippet = _build_snippet(candidate.text, query_terms, max_chars)
         if candidate_snippet:
             candidate.snippet = candidate_snippet
+
+    if settings.enable_hf_reranker and candidates:
+        top_n = max(1, min(len(candidates), int(settings.hf_reranker_top_n)))
+        ranked_indices = sorted(range(len(candidates)), key=lambda i: candidates[i].rerank_score, reverse=True)[:top_n]
+        rerank_texts = [candidates[idx].text for idx in ranked_indices]
+        hf_scores = score_hf_reranker(query=query, texts=rerank_texts)
+        if len(hf_scores) == len(ranked_indices):
+            hf_norm = _normalize_scores(hf_scores)
+            weight = min(1.0, max(0.0, float(settings.hf_reranker_weight)))
+            for local_idx, candidate_idx in enumerate(ranked_indices):
+                base_score = candidates[candidate_idx].rerank_score
+                candidates[candidate_idx].rerank_score = round(
+                    ((1.0 - weight) * base_score) + (weight * hf_norm[local_idx]),
+                    6,
+                )
 
     candidates.sort(key=lambda item: item.rerank_score, reverse=True)
     return candidates

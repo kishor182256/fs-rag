@@ -1,4 +1,6 @@
-from fastapi import APIRouter, File, UploadFile
+from typing import Literal
+
+from fastapi import APIRouter, File, Query, UploadFile
 
 from app.schemas.agentic import AgenticQueryRequest, AgenticQueryResponse
 from app.schemas.ingestion import IngestionResponse, QueryRequest, QueryResponse
@@ -10,8 +12,11 @@ router = APIRouter()
 
 
 @router.post("/ingest/pdf", response_model=IngestionResponse)
-async def ingest_pdf_endpoint(file: UploadFile = File(...)) -> IngestionResponse:
-    return await ingest_pdf(file)
+async def ingest_pdf_endpoint(
+    file: UploadFile = File(...),
+    pipeline: Literal["auto", "legacy", "hf"] = Query(default="auto"),
+) -> IngestionResponse:
+    return await ingest_pdf(file, pipeline=pipeline)
 
 
 @router.post("/query", response_model=QueryResponse, response_model_exclude_none=True)

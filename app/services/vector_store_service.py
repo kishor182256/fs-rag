@@ -28,6 +28,13 @@ class VectorSearchHit:
     image_name: str = ""
 
 
+def _retrieval_text_collection() -> str:
+    hf_collection = str(settings.hf_qdrant_collection or "").strip()
+    if settings.force_hf_retrieval_collection and hf_collection:
+        return hf_collection
+    return settings.qdrant_collection
+
+
 def qdrant_health() -> tuple[str, str]:
     if not settings.enable_vector_indexing:
         return "disabled", "vector indexing disabled by config"
@@ -37,10 +44,11 @@ def qdrant_health() -> tuple[str, str]:
         return "down", str(exc)
 
     try:
-        exists = client.collection_exists(settings.qdrant_collection)
+        retrieval_collection = _retrieval_text_collection()
+        exists = client.collection_exists(retrieval_collection)
         return (
             "up",
-            f"host={settings.qdrant_host} port={settings.qdrant_port} collection={settings.qdrant_collection} exists={exists}",
+            f"host={settings.qdrant_host} port={settings.qdrant_port} retrieval_collection={retrieval_collection} exists={exists}",
         )
     except Exception as exc:
         return "down", f"Unable to query collection state: {exc}"
@@ -110,7 +118,7 @@ def _collection_exists(client: Any, collection_name: str) -> bool:
         return False
 
 
-def find_duplicate_by_file_hash(file_sha256: str) -> dict | None:
+def find_duplicate_by_file_hash(file_sha256: str, collection_name: str | None = None) -> dict | None:
     normalized = str(file_sha256 or "").strip().lower()
     if not normalized:
         return None
@@ -123,9 +131,14 @@ def find_duplicate_by_file_hash(file_sha256: str) -> dict | None:
     except Exception:
         return None
 
-    collection_name = settings.qdrant_collection
-    if not _collection_exists(client, collection_name):
-        return None
+    candidate_collections: list[str] = []
+    if collection_name:
+        candidate_collections.append(collection_name)
+    else:
+        candidate_collections.append(settings.qdrant_collection)
+        hf_collection = str(settings.hf_qdrant_collection or "").strip()
+        if hf_collection and hf_collection not in candidate_collections:
+            candidate_collections.append(hf_collection)
 
     hash_filter = qmodels.Filter(
         must=[
@@ -136,26 +149,32 @@ def find_duplicate_by_file_hash(file_sha256: str) -> dict | None:
         ]
     )
 
-    try:
-        points, _ = client.scroll(
-            collection_name=collection_name,
-            scroll_filter=hash_filter,
-            limit=1,
-            with_payload=True,
-            with_vectors=False,
-        )
-    except Exception:
-        return None
+    for target_collection in candidate_collections:
+        if not _collection_exists(client, target_collection):
+            continue
+        try:
+            points, _ = client.scroll(
+                collection_name=target_collection,
+                scroll_filter=hash_filter,
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception:
+            continue
 
-    if not points:
-        return None
+        if not points:
+            continue
 
-    payload = points[0].payload or {}
-    return {
-        "doc_id": str(payload.get("doc_id", "")),
-        "source_file": str(payload.get("source_file", "")),
-        "file_sha256": normalized,
-    }
+        payload = points[0].payload or {}
+        return {
+            "doc_id": str(payload.get("doc_id", "")),
+            "source_file": str(payload.get("source_file", "")),
+            "file_sha256": normalized,
+            "collection_name": target_collection,
+        }
+
+    return None
 
 
 async def index_chunks(
@@ -163,6 +182,7 @@ async def index_chunks(
     source_file: str,
     chunks: list[dict],
     file_sha256: str = "",
+    collection_name: str | None = None,
 ) -> dict:
     if not settings.enable_vector_indexing:
         return {"status": "disabled", "points_indexed": 0}
@@ -176,9 +196,13 @@ async def index_chunks(
     except EmbeddingUnavailableError as exc:
         return {"status": "embedding_unavailable", "points_indexed": 0, "error": str(exc)}
 
+    target_collection = (collection_name or settings.qdrant_collection).strip()
+    if not target_collection:
+        target_collection = settings.qdrant_collection
+
     try:
         client = _client()
-        _ensure_collection(client, len(vectors[0]))
+        _ensure_collection_named(client=client, size=len(vectors[0]), collection_name=target_collection)
     except VectorStoreUnavailableError as exc:
         return {"status": "qdrant_unavailable", "points_indexed": 0, "error": str(exc)}
 
@@ -207,11 +231,11 @@ async def index_chunks(
         )
 
     try:
-        client.upsert(collection_name=settings.qdrant_collection, points=points, wait=False)
+        client.upsert(collection_name=target_collection, points=points, wait=False)
     except Exception as exc:
         return {"status": "qdrant_error", "points_indexed": 0, "error": str(exc)}
 
-    return {"status": "indexed", "points_indexed": len(points)}
+    return {"status": "indexed", "points_indexed": len(points), "collection": target_collection}
 
 
 async def index_multimodal_image_records(
@@ -354,15 +378,17 @@ async def search_chunks_semantic(query: str, limit: int) -> tuple[list[VectorSea
     except EmbeddingUnavailableError:
         return [], "unavailable"
 
+    target_collection = _retrieval_text_collection()
     try:
         client = _client()
-        _ensure_collection(client, len(query_vector))
     except VectorStoreUnavailableError:
+        return [], "unavailable"
+    if not _collection_exists(client, target_collection):
         return [], "unavailable"
 
     try:
         search_result = client.query_points(
-            collection_name=settings.qdrant_collection,
+            collection_name=target_collection,
             query=query_vector,
             limit=limit,
         )
@@ -370,7 +396,7 @@ async def search_chunks_semantic(query: str, limit: int) -> tuple[list[VectorSea
     except Exception:
         try:
             points = client.search(
-                collection_name=settings.qdrant_collection,
+                collection_name=target_collection,
                 query_vector=query_vector,
                 limit=limit,
             )
@@ -518,7 +544,8 @@ def load_text_chunks_for_bm25(limit: int = 5000) -> list[dict]:
     except VectorStoreUnavailableError:
         return []
 
-    if not _collection_exists(client, settings.qdrant_collection):
+    target_collection = _retrieval_text_collection()
+    if not _collection_exists(client, target_collection):
         return []
 
     rows: list[dict] = []
@@ -528,7 +555,7 @@ def load_text_chunks_for_bm25(limit: int = 5000) -> list[dict]:
     while len(rows) < limit:
         try:
             points, next_offset = client.scroll(
-                collection_name=settings.qdrant_collection,
+                collection_name=target_collection,
                 limit=min(page_size, limit - len(rows)),
                 offset=offset,
                 with_payload=True,

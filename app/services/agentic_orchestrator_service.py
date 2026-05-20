@@ -5,6 +5,7 @@ from app.schemas.agentic import (
     AgenticQueryRequest,
     AgenticQueryResponse,
     EvidenceItem,
+    ImageReference,
     ResponseMetadata,
     ResponseSource,
 )
@@ -57,7 +58,7 @@ def _append_steps(steps: list[AgentStep], step: str, status: str, detail: str) -
 
 
 def _citations_for_response(answer: str, evidence: list[EvidenceItem], limit: int) -> list[str]:
-    cited_ids = re.findall(r"\((chunk_[A-Za-z0-9_-]+\s+p\d+-\d+)\)", answer or "")
+    cited_ids = re.findall(r"\(((?:chunk|image)_[A-Za-z0-9_-]+\s+p\d+(?:-\d+)?)\)", answer or "")
     if cited_ids:
         unique: list[str] = []
         seen: set[str] = set()
@@ -66,7 +67,36 @@ def _citations_for_response(answer: str, evidence: list[EvidenceItem], limit: in
             if marker not in seen:
                 unique.append(marker)
                 seen.add(marker)
-        return unique[: max(1, limit)]
+
+        # Collapse redundant citations for the same chunk/image id by keeping the widest page span.
+        # Example: keep (chunk_00004 p5-8) and drop (chunk_00004 p5).
+        parsed_pattern = re.compile(r"^\(((?:chunk|image)_[A-Za-z0-9_-]+)\s+p(\d+)(?:-(\d+))?\)$")
+        selected: list[str] = []
+        by_id: dict[str, tuple[int, int, int]] = {}
+        # value: id -> (position_in_selected, start_page, end_page)
+        for marker in unique:
+            parsed = parsed_pattern.match(marker)
+            if not parsed:
+                selected.append(marker)
+                continue
+
+            cite_id = parsed.group(1)
+            start = int(parsed.group(2))
+            end = int(parsed.group(3) or parsed.group(2))
+            current = by_id.get(cite_id)
+            if current is None:
+                by_id[cite_id] = (len(selected), start, end)
+                selected.append(marker)
+                continue
+
+            pos, old_start, old_end = current
+            old_span = old_end - old_start
+            new_span = end - start
+            if new_span > old_span or (new_span == old_span and start < old_start):
+                selected[pos] = marker
+                by_id[cite_id] = (pos, start, end)
+
+        return selected[: max(1, limit)]
 
     return [e.citation for e in evidence[:limit]]
 
@@ -99,6 +129,31 @@ def _build_sources(evidence: list[EvidenceItem], limit: int) -> list[ResponseSou
         seen.add(key)
         sources.append(ResponseSource(document=item.source_file, pages=pages))
     return sources
+
+
+def _build_image_references(evidence: list[EvidenceItem], limit: int) -> list[ImageReference]:
+    refs: list[ImageReference] = []
+    seen: set[str] = set()
+    for item in evidence:
+        if item.modality != "image":
+            continue
+        key = f"{item.source_file}:{item.page_start}:{item.image_name or ''}"
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append(
+            ImageReference(
+                document=item.source_file,
+                page=item.page_start,
+                image_name=item.image_name,
+                image_path=item.image_path,
+                caption=item.snippet,
+                citation=item.citation,
+            )
+        )
+        if len(refs) >= max(1, limit):
+            break
+    return refs
 
 
 def _retrieval_method(use_vector: bool, vector_status: str) -> str:
@@ -137,6 +192,7 @@ async def run_agentic_query(request: AgenticQueryRequest) -> AgenticQueryRespons
             status="blocked",
             answer="Query blocked by security guardrails.",
             final_answer="Query blocked by security guardrails.",
+            image_references=[],
             metadata=_response_metadata(
                 model=None,
                 use_vector=request.use_vector,
@@ -165,6 +221,7 @@ async def run_agentic_query(request: AgenticQueryRequest) -> AgenticQueryRespons
             input_guardrails=input_guardrails if include_debug else None,
             retrieval_guardrails=retrieval_report if include_debug else None,
             sources=[],
+            image_references=[],
             metadata=_response_metadata(
                 model=None,
                 use_vector=request.use_vector,
@@ -256,6 +313,7 @@ async def run_agentic_query(request: AgenticQueryRequest) -> AgenticQueryRespons
                     critic=critic if include_debug else None,
                     evidence=evidence if include_evidence else None,
                     sources=_build_sources(evidence, request.top_k),
+                    image_references=_build_image_references(evidence, request.top_k),
                     metadata=_response_metadata(
                         model=answer_model,
                         use_vector=request.use_vector,
@@ -280,6 +338,7 @@ async def run_agentic_query(request: AgenticQueryRequest) -> AgenticQueryRespons
                 critic=critic if include_debug else None,
                 evidence=evidence if include_evidence else None,
                 sources=_build_sources(evidence, request.top_k),
+                image_references=_build_image_references(evidence, request.top_k),
                 metadata=_response_metadata(
                     model=answer_model,
                     use_vector=request.use_vector,
@@ -308,6 +367,7 @@ async def run_agentic_query(request: AgenticQueryRequest) -> AgenticQueryRespons
             critic=critic if include_debug else None,
             evidence=evidence if include_evidence else None,
             sources=_build_sources(evidence, request.top_k),
+            image_references=_build_image_references(evidence, request.top_k),
             metadata=_response_metadata(
                 model=answer_model,
                 use_vector=request.use_vector,
@@ -332,6 +392,7 @@ async def run_agentic_query(request: AgenticQueryRequest) -> AgenticQueryRespons
         critic=critic if include_debug else None,
         evidence=evidence if include_evidence else None,
         sources=_build_sources(evidence, request.top_k),
+        image_references=_build_image_references(evidence, request.top_k),
         metadata=_response_metadata(
             model=answer_model,
             use_vector=request.use_vector,

@@ -23,7 +23,7 @@ def enforce_output_guardrails(
 
     if require_citations:
         # At least one citation marker must be present when an answer is returned.
-        if not re.search(r"\(chunk_[A-Za-z0-9_-]+\s+p\d+-\d+\)", answer):
+        if not re.search(r"\((?:chunk|image)_[A-Za-z0-9_-]+\s+p\d+(?:-\d+)?\)", answer or ""):
             issues.append("missing_required_citations")
 
     return len(issues) == 0, issues

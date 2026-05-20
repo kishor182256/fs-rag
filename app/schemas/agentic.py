@@ -78,12 +78,22 @@ class ResponseMetadata(BaseModel):
     grounded: bool = False
 
 
+class ImageReference(BaseModel):
+    document: str
+    page: int
+    image_name: str | None = None
+    image_path: str | None = None
+    caption: str | None = None
+    citation: str | None = None
+
+
 class AgenticQueryResponse(BaseModel):
     query: str
     status: Literal["completed", "blocked", "abstained", "failed"]
     answer: str | None = None
     final_answer: str | None = None
     sources: list[ResponseSource] = Field(default_factory=list)
+    image_references: list[ImageReference] = Field(default_factory=list)
     metadata: ResponseMetadata | None = None
     citations: list[str] = Field(default_factory=list)
     planner: AgentPlan | None = None

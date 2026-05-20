@@ -23,6 +23,7 @@ class IngestionResponse(BaseModel):
     file_size_bytes: int
     pages_processed: int
     chunks_created: int
+    ingestion_pipeline: Literal["legacy", "hf_enriched", "hf_fallback_legacy"] = "legacy"
     manifest_path: str
     message: str
     months_detected: list[str] = Field(default_factory=list)

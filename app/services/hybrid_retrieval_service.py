@@ -41,6 +41,21 @@ STOPWORDS = {
     "who",
     "with",
 }
+IMAGE_INTENT_MARKERS = {
+    "image",
+    "images",
+    "diagram",
+    "diagrams",
+    "figure",
+    "figures",
+    "chart",
+    "charts",
+    "graph",
+    "graphs",
+    "visual",
+    "visuals",
+    "show",
+}
 
 
 def _query_keywords(query: str) -> list[str]:
@@ -55,6 +70,13 @@ def _compute_matched_terms(query: str, text: str) -> list[str]:
     if not query_terms or not text_terms:
         return []
     return sorted(query_terms.intersection(text_terms))
+
+
+def _needs_image_routing(query: str, include_images: bool) -> bool:
+    if include_images:
+        return True
+    lowered = query.lower()
+    return any(marker in lowered for marker in IMAGE_INTENT_MARKERS)
 
 
 def _merge_candidates(
@@ -156,13 +178,55 @@ def _post_filter_candidates(candidates: list[RetrievalCandidate], request: Query
     return kept
 
 
+def _ensure_image_presence(
+    *,
+    candidates: list[RetrievalCandidate],
+    ranked_candidates: list[RetrievalCandidate],
+    top_k: int,
+    needs_images: bool,
+) -> list[RetrievalCandidate]:
+    if not needs_images:
+        return candidates[:top_k]
+
+    top = candidates[:top_k]
+    if any(candidate.modality == "image" for candidate in top):
+        return top
+
+    fallback_image = next((candidate for candidate in ranked_candidates if candidate.modality == "image"), None)
+    if fallback_image is None:
+        return top
+
+    deduped = []
+    seen: set[str] = set()
+    for candidate in top + [fallback_image]:
+        key = f"{candidate.doc_id}:{candidate.chunk_id}:{candidate.modality}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+
+    if len(deduped) > top_k:
+        # keep best scored candidates after ensuring one image is present
+        deduped.sort(key=lambda item: item.rerank_score, reverse=True)
+        image_kept = next((item for item in deduped if item.modality == "image"), None)
+        top_only = deduped[:top_k]
+        if image_kept and all(item.modality != "image" for item in top_only):
+            top_only[-1] = image_kept
+        return top_only
+
+    return deduped[:top_k]
+
+
 async def run_hybrid_retrieval(request: QueryRequest) -> tuple[list[RetrievalCandidate], str]:
+    needs_images = _needs_image_routing(query=request.query, include_images=request.include_images)
+    effective_request = request.model_copy(update={"include_images": needs_images})
+
     chunks = load_text_chunks_for_bm25(limit=5000)
     bm25_candidates: list[RetrievalCandidate] = []
     if chunks:
         bm25_candidates = search_bm25(
             chunks=chunks,
-            request=request,
+            request=effective_request,
             bm25_k1=settings.bm25_k1,
             bm25_b=settings.bm25_b,
             limit=max(request.top_k * 4, 20),
@@ -175,7 +239,7 @@ async def run_hybrid_retrieval(request: QueryRequest) -> tuple[list[RetrievalCan
             query=request.query,
             limit=max(request.vector_top_k, settings.vector_query_limit),
         )
-        if request.include_images and settings.enable_multimodal_ingest:
+        if needs_images and settings.enable_multimodal_ingest:
             image_hits, image_vector_status = await search_images_semantic(
                 query=request.query,
                 limit=max(request.vector_top_k, settings.vector_query_limit),
@@ -191,10 +255,16 @@ async def run_hybrid_retrieval(request: QueryRequest) -> tuple[list[RetrievalCan
     merged = _merge_candidates(
         bm25_candidates=bm25_candidates,
         vector_candidates=vector_candidates,
-        request=request,
+        request=effective_request,
     )
     if not merged:
         return [], vector_status
     reranked = rerank_candidates(query=request.query, candidates=merged, request=request)
     filtered = _post_filter_candidates(reranked, request)
-    return filtered[: request.top_k], vector_status
+    final_candidates = _ensure_image_presence(
+        candidates=filtered,
+        ranked_candidates=reranked,
+        top_k=request.top_k,
+        needs_images=needs_images,
+    )
+    return final_candidates, vector_status

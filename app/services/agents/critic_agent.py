@@ -14,7 +14,7 @@ def evaluate_answer(
     if not candidates:
         issues.append("no_evidence_candidates")
 
-    citation_count = len(re.findall(r"\(chunk_[A-Za-z0-9_-]+\s+p\d+-\d+\)", answer))
+    citation_count = len(re.findall(r"\((?:chunk|image)_[A-Za-z0-9_-]+\s+p\d+(?:-\d+)?\)", answer or ""))
     if require_citations and citation_count == 0:
         issues.append("missing_citations")
 
