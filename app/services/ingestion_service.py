@@ -1,4 +1,5 @@
 import hashlib
+import asyncio
 from pathlib import Path
 import re
 from typing import Any, Literal
@@ -8,11 +9,13 @@ from fastapi import HTTPException, UploadFile
 from pypdf import PdfReader
 
 from app.core.config import settings
-from app.schemas.ingestion import IngestionResponse
+from app.schemas.ingestion import IngestionJobAcceptedResponse, IngestionJobStatusResponse, IngestionResponse
+from app.services.aws_async_ingestion_service import AwsAsyncIngestionService
 from app.services.chunker import build_chunks
 from app.services.metadata_enricher import extract_metadata
 from app.services.multimodal_service import generate_vlm_caption
 from app.services.pdf_extractor import extract_pdf_pages
+from app.services.s3_storage_service import S3UploadService
 from app.services.vector_store_service import (
     find_duplicate_by_file_hash,
     index_chunks,
@@ -152,6 +155,8 @@ class HFChunkEnricher:
 
 
 _hf_enricher = HFChunkEnricher()
+_s3_uploader = S3UploadService()
+_aws_async_service = AwsAsyncIngestionService()
 
 
 def _hf_collection_name() -> str:
@@ -174,8 +179,80 @@ def _requested_text_collection(pipeline: Literal["auto", "legacy", "hf"]) -> str
     return settings.qdrant_collection
 
 
+def _resolve_pipeline_target(
+    pipeline: Literal["auto", "legacy", "hf"],
+) -> tuple[str, str, str, bool]:
+    requested_collection = _requested_text_collection(pipeline=pipeline)
+    hf_requested = pipeline == "hf" or (pipeline == "auto" and requested_collection == _hf_collection_name())
+    hf_available = bool(_hf_enricher.is_available()) if hf_requested else False
+    if hf_requested and hf_available:
+        target_collection = requested_collection
+        pipeline_used = "hf_enriched"
+    elif hf_requested:
+        target_collection = settings.qdrant_collection
+        pipeline_used = "hf_fallback_legacy"
+    else:
+        target_collection = settings.qdrant_collection
+        pipeline_used = "legacy"
+
+    duplicate_scope_collection = requested_collection if hf_requested else settings.qdrant_collection
+    return target_collection, pipeline_used, duplicate_scope_collection, hf_requested
+
+
 def _safe_filename(name: str) -> str:
     return "".join(ch for ch in name if ch.isalnum() or ch in {"-", "_", "."}).strip(".") or "upload.pdf"
+
+
+def _resolve_async_mode(
+    *,
+    pipeline: Literal["auto", "legacy", "hf"],
+    async_mode: bool | None,
+) -> bool:
+    if async_mode is not None:
+        return bool(async_mode)
+
+    # Default behavior: HF pipeline prefers async S3->SQS path when enabled.
+    if pipeline == "hf" and settings.enable_async_ingestion:
+        return True
+    return False
+
+
+def _resolve_wait_for_completion(
+    *,
+    effective_async_mode: bool,
+    wait_for_completion: bool | None,
+) -> bool:
+    if not effective_async_mode:
+        return False
+    if wait_for_completion is not None:
+        return bool(wait_for_completion)
+    return bool(settings.async_wait_for_completion_default)
+
+
+async def _wait_for_job_terminal_state(job_id: str) -> dict | None:
+    timeout_seconds = max(1, int(settings.async_wait_timeout_seconds))
+    poll_seconds = max(0.2, float(settings.async_wait_poll_seconds))
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+
+    while True:
+        item, ok, error = _aws_async_service.get_job(job_id=job_id)
+        if not ok:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "job_status_unavailable",
+                    "message": "Could not fetch ingestion job status while waiting for completion.",
+                    "reason": error or "unknown_error",
+                },
+            )
+        if item is not None:
+            status = str(item.get("status", "")).strip().lower()
+            if status in {"completed", "failed"}:
+                return item
+
+        if asyncio.get_running_loop().time() >= deadline:
+            return None
+        await asyncio.sleep(poll_seconds)
 
 
 async def _save_upload(file: UploadFile, destination: Path) -> tuple[int, str]:
@@ -198,6 +275,47 @@ async def _save_upload(file: UploadFile, destination: Path) -> tuple[int, str]:
             hasher.update(chunk)
             out_file.write(chunk)
     return total_size, hasher.hexdigest()
+
+
+def _queue_ingestion_job(
+    *,
+    doc_id: str,
+    source_file: str,
+    pipeline: str,
+    file_sha256: str,
+    s3_bucket: str,
+    s3_key: str,
+) -> tuple[dict, bool, str]:
+    job_item, created, create_error = _aws_async_service.create_job(
+        doc_id=doc_id,
+        source_file=source_file,
+        pipeline=pipeline,
+        file_sha256=file_sha256,
+        s3_bucket=s3_bucket,
+        s3_key=s3_key,
+    )
+    if not created:
+        return {}, False, create_error
+
+    message_payload = {
+        "job_id": job_item["job_id"],
+        "doc_id": doc_id,
+        "source_file": source_file,
+        "pipeline": pipeline,
+        "file_sha256": file_sha256,
+        "s3_bucket": s3_bucket,
+        "s3_key": s3_key,
+        "submitted_at": job_item.get("created_at", ""),
+    }
+
+    message_id, sent, send_error = _aws_async_service.enqueue_job(job_payload=message_payload)
+    if not sent:
+        _aws_async_service.mark_job_failed(job_id=job_item["job_id"], error=send_error)
+        return {}, False, send_error
+
+    _aws_async_service.update_job_message_id(job_id=job_item["job_id"], message_id=message_id)
+    job_item["message_id"] = message_id
+    return job_item, True, ""
 
 
 async def _extract_pdf_image_records(file_path: Path, doc_id: str, source_file: str) -> tuple[list[dict], dict]:
@@ -276,52 +394,36 @@ async def _extract_pdf_image_records(file_path: Path, doc_id: str, source_file: 
     return image_records, summary
 
 
-async def ingest_pdf(file: UploadFile, pipeline: Literal["auto", "legacy", "hf"] = "auto") -> IngestionResponse:
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Missing filename.")
+async def process_saved_pdf(
+    *,
+    file_path: Path,
+    doc_id: str,
+    source_file: str,
+    file_size: int,
+    file_sha256: str,
+    pipeline: Literal["auto", "legacy", "hf"] = "auto",
+    skip_duplicate_check: bool = False,
+) -> IngestionResponse:
+    target_collection, pipeline_used, duplicate_scope_collection, _ = _resolve_pipeline_target(pipeline=pipeline)
 
-    original_name = _safe_filename(file.filename)
-    if not original_name.lower().endswith(".pdf"):
-        raise HTTPException(status_code=415, detail="Only PDF files are supported.")
-
-    doc_id = str(uuid.uuid4())
-    stored_name = f"{doc_id}_{original_name}"
-    destination = settings.upload_dir / stored_name
-
-    file_size, file_sha256 = await _save_upload(file, destination)
-
-    requested_collection = _requested_text_collection(pipeline=pipeline)
-    hf_requested = pipeline == "hf" or (pipeline == "auto" and requested_collection == _hf_collection_name())
-    hf_available = bool(_hf_enricher.is_available()) if hf_requested else False
-    if hf_requested and hf_available:
-        target_collection = requested_collection
-        pipeline_used = "hf_enriched"
-    elif hf_requested:
-        target_collection = settings.qdrant_collection
-        pipeline_used = "hf_fallback_legacy"
-    else:
-        target_collection = settings.qdrant_collection
-        pipeline_used = "legacy"
-
-    duplicate_scope_collection = requested_collection if hf_requested else settings.qdrant_collection
-    duplicate = find_duplicate_by_file_hash(file_sha256=file_sha256, collection_name=duplicate_scope_collection)
-    if duplicate is not None:
-        destination.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "duplicate_file",
-                "message": "This file has already been ingested.",
-                "file_sha256": file_sha256,
-                "existing_doc_id": duplicate.get("doc_id", ""),
-                "existing_source_file": duplicate.get("source_file", ""),
-                "collection_name": duplicate.get("collection_name", duplicate_scope_collection),
-                "duplicate_scope_collection": duplicate_scope_collection,
-            },
-        )
+    if not skip_duplicate_check:
+        duplicate = find_duplicate_by_file_hash(file_sha256=file_sha256, collection_name=duplicate_scope_collection)
+        if duplicate is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "duplicate_file",
+                    "message": "This file has already been ingested.",
+                    "file_sha256": file_sha256,
+                    "existing_doc_id": duplicate.get("doc_id", ""),
+                    "existing_source_file": duplicate.get("source_file", ""),
+                    "collection_name": duplicate.get("collection_name", duplicate_scope_collection),
+                    "duplicate_scope_collection": duplicate_scope_collection,
+                },
+            )
 
     pages = extract_pdf_pages(
-        destination,
+        file_path,
         min_page_text_chars=settings.min_page_text_chars,
         enable_ocr_fallback=settings.enable_ocr_fallback,
     )
@@ -403,25 +505,25 @@ async def ingest_pdf(file: UploadFile, pipeline: Literal["auto", "legacy", "hf"]
 
     vector_index_summary = await index_chunks(
         doc_id=doc_id,
-        source_file=original_name,
+        source_file=source_file,
         chunks=chunk_records,
         file_sha256=file_sha256,
         collection_name=target_collection,
     )
 
     image_records, image_extraction_summary = await _extract_pdf_image_records(
-        file_path=destination,
+        file_path=file_path,
         doc_id=doc_id,
-        source_file=original_name,
+        source_file=source_file,
     )
     multimodal_index_summary = await index_multimodal_image_records(
         doc_id=doc_id,
-        source_file=original_name,
+        source_file=source_file,
         image_records=image_records,
     )
     return IngestionResponse(
         doc_id=doc_id,
-        source_file=original_name,
+        source_file=source_file,
         file_size_bytes=file_size,
         pages_processed=len(pages),
         chunks_created=len(chunks),
@@ -449,4 +551,227 @@ async def ingest_pdf(file: UploadFile, pipeline: Literal["auto", "legacy", "hf"]
             "multimodal_extraction_summary": image_extraction_summary,
             "multimodal_vector_index_summary": multimodal_index_summary,
         },
+    )
+
+
+async def ingest_pdf(
+    file: UploadFile,
+    pipeline: Literal["auto", "legacy", "hf"] = "auto",
+    async_mode: bool | None = None,
+    wait_for_completion: bool | None = None,
+) -> IngestionResponse | IngestionJobAcceptedResponse:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename.")
+
+    original_name = _safe_filename(file.filename)
+    if not original_name.lower().endswith(".pdf"):
+        raise HTTPException(status_code=415, detail="Only PDF files are supported.")
+
+    doc_id = str(uuid.uuid4())
+    stored_name = f"{doc_id}_{original_name}"
+    destination = settings.upload_dir / stored_name
+
+    file_size, file_sha256 = await _save_upload(file, destination)
+    effective_async_mode = _resolve_async_mode(pipeline=pipeline, async_mode=async_mode)
+    effective_wait_for_completion = _resolve_wait_for_completion(
+        effective_async_mode=effective_async_mode,
+        wait_for_completion=wait_for_completion,
+    )
+
+    _, pipeline_used, duplicate_scope_collection, _ = _resolve_pipeline_target(pipeline=pipeline)
+    if effective_async_mode:
+        duplicate_job, duplicate_check_ok, duplicate_check_error = _aws_async_service.find_duplicate_by_file_hash(
+            file_sha256=file_sha256,
+            pipeline=pipeline,
+        )
+        if not duplicate_check_ok:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "duplicate_check_failed",
+                    "message": "Could not validate duplicate file in AWS async pipeline.",
+                    "reason": duplicate_check_error or "unknown_error",
+                },
+            )
+        if duplicate_job is not None:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "duplicate_file",
+                    "message": "This file has already been ingested in AWS async pipeline.",
+                    "file_sha256": file_sha256,
+                    "existing_job_id": str(duplicate_job.get("job_id", "")),
+                    "existing_doc_id": str(duplicate_job.get("doc_id", "")),
+                    "existing_source_file": str(duplicate_job.get("source_file", "")),
+                    "pipeline": str(duplicate_job.get("pipeline", pipeline)),
+                    "status": str(duplicate_job.get("status", "")),
+                    "duplicate_scope_collection": "aws_async_pipeline",
+                },
+            )
+    else:
+        duplicate = find_duplicate_by_file_hash(file_sha256=file_sha256, collection_name=duplicate_scope_collection)
+        if duplicate is not None:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "duplicate_file",
+                    "message": "This file has already been ingested.",
+                    "file_sha256": file_sha256,
+                    "existing_doc_id": duplicate.get("doc_id", ""),
+                    "existing_source_file": duplicate.get("source_file", ""),
+                    "collection_name": duplicate.get("collection_name", duplicate_scope_collection),
+                    "duplicate_scope_collection": duplicate_scope_collection,
+                },
+            )
+
+    if effective_async_mode:
+        if not settings.enable_async_ingestion:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "async_ingestion_disabled",
+                    "message": "Async ingestion is disabled. Set ENABLE_ASYNC_INGESTION=true.",
+                },
+            )
+
+        s3_upload_summary, s3_uploaded, s3_error = _s3_uploader.upload_pdf(
+            file_path=destination,
+            doc_id=doc_id,
+            source_file=original_name,
+        )
+        if not s3_uploaded:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "s3_upload_failed",
+                    "message": "Could not upload file to S3 for async ingestion.",
+                    "reason": s3_error or "unknown_error",
+                    "s3_upload_summary": s3_upload_summary,
+                },
+            )
+
+        job_item, queued, queue_error = _queue_ingestion_job(
+            doc_id=doc_id,
+            source_file=original_name,
+            pipeline=pipeline,
+            file_sha256=file_sha256,
+            s3_bucket=str(s3_upload_summary.get("bucket", "")),
+            s3_key=str(s3_upload_summary.get("key", "")),
+        )
+        destination.unlink(missing_ok=True)
+        if not queued:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "job_queue_failed",
+                    "message": "Could not enqueue ingestion job.",
+                    "reason": queue_error or "unknown_error",
+                },
+            )
+
+        accepted_response = IngestionJobAcceptedResponse(
+            status="accepted",
+            message="File accepted and queued for async ingestion.",
+            job_id=str(job_item.get("job_id", "")),
+            doc_id=doc_id,
+            source_file=original_name,
+            ingestion_pipeline=pipeline_used,
+            queue=str(settings.sqs_queue_url or ""),
+            s3_bucket=str(s3_upload_summary.get("bucket", "")),
+            s3_key=str(s3_upload_summary.get("key", "")),
+        )
+        if not effective_wait_for_completion:
+            return accepted_response
+
+        terminal_item = await _wait_for_job_terminal_state(job_id=accepted_response.job_id)
+        if terminal_item is None:
+            return IngestionJobAcceptedResponse(
+                status="accepted",
+                message="File queued and processing; completion wait timed out. Check job status endpoint.",
+                job_id=accepted_response.job_id,
+                doc_id=accepted_response.doc_id,
+                source_file=accepted_response.source_file,
+                ingestion_pipeline=accepted_response.ingestion_pipeline,
+                queue=accepted_response.queue,
+                s3_bucket=accepted_response.s3_bucket,
+                s3_key=accepted_response.s3_key,
+            )
+
+        terminal_status = str(terminal_item.get("status", "")).strip().lower()
+        if terminal_status == "failed":
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "ingestion_job_failed",
+                    "message": "Queued ingestion job failed.",
+                    "job_id": str(terminal_item.get("job_id", accepted_response.job_id)),
+                    "reason": str(terminal_item.get("error", "") or "unknown_error"),
+                },
+            )
+
+        result = terminal_item.get("result", {})
+        if isinstance(result, dict):
+            payload = result.get("ingestion_response")
+            if isinstance(payload, dict):
+                try:
+                    return IngestionResponse.model_validate(payload)
+                except Exception:
+                    pass
+        return IngestionJobAcceptedResponse(
+            status="accepted",
+            message="Ingestion completed, but full response payload was unavailable. Check job status result.",
+            job_id=accepted_response.job_id,
+            doc_id=accepted_response.doc_id,
+            source_file=accepted_response.source_file,
+            ingestion_pipeline=accepted_response.ingestion_pipeline,
+            queue=accepted_response.queue,
+            s3_bucket=accepted_response.s3_bucket,
+            s3_key=accepted_response.s3_key,
+        )
+
+    return await process_saved_pdf(
+        file_path=destination,
+        doc_id=doc_id,
+        source_file=original_name,
+        file_size=file_size,
+        file_sha256=file_sha256,
+        pipeline=pipeline,
+        skip_duplicate_check=True,
+    )
+
+
+def get_ingestion_job_status(job_id: str) -> IngestionJobStatusResponse:
+    item, ok, error = _aws_async_service.get_job(job_id=job_id)
+    if not ok:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "job_status_unavailable",
+                "message": "Could not fetch ingestion job status.",
+                "reason": error or "unknown_error",
+            },
+        )
+    if item is None:
+        return IngestionJobStatusResponse(job_id=job_id, status="unknown")
+
+    status = str(item.get("status", "unknown")).strip().lower() or "unknown"
+    if status not in {"queued", "processing", "completed", "failed", "unknown"}:
+        status = "unknown"
+
+    return IngestionJobStatusResponse(
+        job_id=str(item.get("job_id", job_id)),
+        status=status,
+        doc_id=str(item.get("doc_id", "")) or None,
+        source_file=str(item.get("source_file", "")) or None,
+        pipeline=str(item.get("pipeline", "")) or None,
+        created_at=str(item.get("created_at", "")) or None,
+        updated_at=str(item.get("updated_at", "")) or None,
+        message_id=str(item.get("message_id", "")) or None,
+        error=str(item.get("error", "")) or None,
+        result=item.get("result", {}) if isinstance(item.get("result", {}), dict) else None,
     )

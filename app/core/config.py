@@ -19,6 +19,25 @@ class Settings(BaseSettings):
     enable_ocr_fallback: bool = False
 
     upload_dir: Path = Path("data/uploads")
+    enable_s3_upload: bool = False
+    s3_upload_required: bool = False
+    aws_region: str = ""
+    s3_bucket_name: str = ""
+    s3_key_prefix: str = "ingestion/raw"
+    s3_endpoint_url: str = ""
+    enable_async_ingestion: bool = False
+    auto_start_async_worker: bool = False
+    async_wait_for_completion_default: bool = True
+    async_wait_timeout_seconds: int = 1800
+    async_wait_poll_seconds: float = 2.0
+    async_worker_poll_wait_seconds: int = 20
+    async_worker_visibility_timeout_seconds: int = 900
+    async_worker_max_messages: int = 1
+    async_worker_max_attempts: int = 3
+    sqs_queue_url: str = ""
+    dynamodb_jobs_table: str = ""
+    dynamodb_job_pk: str = "job_id"
+    dynamodb_endpoint_url: str = ""
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
@@ -56,6 +75,11 @@ class Settings(BaseSettings):
     hf_chunk_type_min_score: float = 0.2
     hf_enrichment_max_chars: int = 1600
     hf_enrichment_entity_limit: int = 12
+    enable_sagemaker_enrichment: bool = False
+    sagemaker_endpoint_name: str = ""
+    sagemaker_region: str = ""
+    sagemaker_content_type: str = "application/json"
+    sagemaker_accept: str = "application/json"
     enable_hf_reranker: bool = False
     hf_reranker_model_name: str = "BAAI/bge-reranker-base"
     hf_reranker_top_n: int = 30

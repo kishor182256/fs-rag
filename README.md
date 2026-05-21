@@ -24,9 +24,55 @@ Starter implementation for ingesting exam-style PDF documents.
 4. Run server:
    `uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`
 
+5. (Async ingest) Run worker:
+   `python -m app.workers.async_ingestion_worker --log-level INFO`
+
+Async worker requirements:
+- `ENABLE_ASYNC_INGESTION=true`
+- `ENABLE_S3_UPLOAD=true`
+- `AWS_REGION`, `S3_BUCKET_NAME`, `SQS_QUEUE_URL`, `DYNAMODB_JOBS_TABLE` configured
+
+Optional fully automatic mode (no manual worker run):
+- set `AUTO_START_ASYNC_WORKER=true`
+- API process starts embedded SQS worker on startup
+
+Optional end-to-end blocking upload response:
+- set `ASYNC_WAIT_FOR_COMPLETION_DEFAULT=true` (default)
+- or call `POST /v1/ingest/pdf?pipeline=hf&wait_for_completion=true`
+- request waits for queued job completion and returns final ingestion response when ready
+
+## AWS worker deployment (ECS/Fargate)
+1. Create ECR repository (example: `rag-ingestion-worker`).
+2. Build image from repo root:
+   `docker build -f worker/Dockerfile -t rag-ingestion-worker:latest .`
+3. Login to ECR:
+   `aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com`
+4. Tag and push image:
+   `docker tag rag-ingestion-worker:latest <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/rag-ingestion-worker:latest`
+   `docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/rag-ingestion-worker:latest`
+5. Create/attach task role policy from `infra/iam-task-role-policy.json` (replace placeholders).
+6. Register task definition from `infra/ecs-task-definition.json` (replace placeholders).
+7. Run ECS service on Fargate with desired count `1+`.
+
+Result:
+- `POST /v1/ingest/pdf?pipeline=hf` uploads to S3, enqueues SQS job.
+- ECS worker consumes SQS, processes ingestion, updates DynamoDB, writes to Qdrant.
+- Data becomes queryable through `POST /v1/agentic/query`.
+
+### Worker image size optimization
+- The worker container intentionally excludes heavy local-ML packages (`sentence-transformers`, `torch`) to keep image size low.
+- This is safe when embeddings/LLM calls are remote (OpenAI/Bedrock/SageMaker).
+- If you require local HF/torch inference inside ECS worker, use a separate heavyweight image profile.
+
 ## Example API calls
 Ingest a PDF:
 `curl -X POST "http://localhost:8000/v1/ingest/pdf" -F "file=@C:/path/doc.pdf"`
+
+Ingest with HF pipeline using async S3/SQS path:
+`curl -X POST "http://localhost:8000/v1/ingest/pdf?pipeline=hf" -F "file=@C:/path/doc.pdf"`
+
+Force async explicitly (any pipeline):
+`curl -X POST "http://localhost:8000/v1/ingest/pdf?pipeline=hf&async_mode=true" -F "file=@C:/path/doc.pdf"`
 
 Duplicate protection:
 - Uploading the same PDF content again is blocked using SHA-256 content hash comparison.

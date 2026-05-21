@@ -31,6 +31,31 @@ class IngestionResponse(BaseModel):
     vector_index_summary: dict = Field(default_factory=dict)
 
 
+class IngestionJobAcceptedResponse(BaseModel):
+    status: Literal["accepted"] = "accepted"
+    message: str
+    job_id: str
+    doc_id: str
+    source_file: str
+    ingestion_pipeline: Literal["legacy", "hf_enriched", "hf_fallback_legacy"] = "legacy"
+    queue: str
+    s3_bucket: str
+    s3_key: str
+
+
+class IngestionJobStatusResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "processing", "completed", "failed", "unknown"]
+    doc_id: str | None = None
+    source_file: str | None = None
+    pipeline: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    message_id: str | None = None
+    error: str | None = None
+    result: dict | None = None
+
+
 class QueryRequest(BaseModel):
     query: str
     top_k: int = Field(default=2, ge=1, le=20)
