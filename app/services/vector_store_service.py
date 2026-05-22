@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 import uuid
+import logging
 
 from app.core.config import settings
 from app.services.embedding_service import EmbeddingUnavailableError, embed_text, embed_texts
 from app.services.multimodal_service import MultimodalUnavailableError, embed_images_clip, embed_text_clip
+
+logger = logging.getLogger(__name__)
 
 
 class VectorStoreUnavailableError(Exception):
@@ -35,6 +38,28 @@ def _retrieval_text_collection() -> str:
     return settings.qdrant_collection
 
 
+def _retrieval_text_collections() -> list[str]:
+    collections: list[str] = []
+    hf_collection = str(settings.hf_qdrant_collection or "").strip()
+    base_collection = str(settings.qdrant_collection or "").strip()
+
+    if settings.force_hf_retrieval_collection and hf_collection:
+        collections.append(hf_collection)
+    if base_collection and base_collection not in collections:
+        collections.append(base_collection)
+    if hf_collection and hf_collection not in collections:
+        collections.append(hf_collection)
+
+    return [collection for collection in collections if collection]
+
+
+def _resolve_first_existing_collection(client: Any) -> str:
+    for collection in _retrieval_text_collections():
+        if _collection_exists(client, collection):
+            return collection
+    return ""
+
+
 def qdrant_health() -> tuple[str, str]:
     if not settings.enable_vector_indexing:
         return "disabled", "vector indexing disabled by config"
@@ -44,11 +69,13 @@ def qdrant_health() -> tuple[str, str]:
         return "down", str(exc)
 
     try:
-        retrieval_collection = _retrieval_text_collection()
-        exists = client.collection_exists(retrieval_collection)
+        candidates = _retrieval_text_collections()
+        retrieval_collection = _resolve_first_existing_collection(client) or (candidates[0] if candidates else "")
+        exists = bool(retrieval_collection) and client.collection_exists(retrieval_collection)
         return (
             "up",
-            f"host={settings.qdrant_host} port={settings.qdrant_port} retrieval_collection={retrieval_collection} exists={exists}",
+            "host=%s port=%s retrieval_candidates=%s selected_collection=%s exists=%s"
+            % (settings.qdrant_host, settings.qdrant_port, ",".join(candidates), retrieval_collection, exists),
         )
     except Exception as exc:
         return "down", f"Unable to query collection state: {exc}"
@@ -375,16 +402,24 @@ async def search_chunks_semantic(query: str, limit: int) -> tuple[list[VectorSea
 
     try:
         query_vector = await embed_text(query)
-    except EmbeddingUnavailableError:
+    except EmbeddingUnavailableError as exc:
+        logger.warning("vector_embedding_unavailable query='%s' reason=%s", query[:120], exc)
         return [], "unavailable"
 
-    target_collection = _retrieval_text_collection()
     try:
         client = _client()
-    except VectorStoreUnavailableError:
+    except VectorStoreUnavailableError as exc:
+        logger.warning("qdrant_client_unavailable reason=%s", exc)
         return [], "unavailable"
-    if not _collection_exists(client, target_collection):
+    target_collection = _resolve_first_existing_collection(client)
+    if not target_collection:
+        logger.warning(
+            "vector_collection_missing candidates=%s qdrant_host=%s",
+            _retrieval_text_collections(),
+            settings.qdrant_host,
+        )
         return [], "unavailable"
+    logger.info("vector_query_collection_selected=%s", target_collection)
 
     try:
         search_result = client.query_points(
@@ -544,9 +579,15 @@ def load_text_chunks_for_bm25(limit: int = 5000) -> list[dict]:
     except VectorStoreUnavailableError:
         return []
 
-    target_collection = _retrieval_text_collection()
-    if not _collection_exists(client, target_collection):
+    target_collection = _resolve_first_existing_collection(client)
+    if not target_collection:
+        logger.warning(
+            "bm25_collection_missing candidates=%s qdrant_host=%s",
+            _retrieval_text_collections(),
+            settings.qdrant_host,
+        )
         return []
+    logger.info("bm25_collection_selected=%s", target_collection)
 
     rows: list[dict] = []
     offset = None

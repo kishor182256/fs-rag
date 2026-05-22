@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 
@@ -201,6 +202,61 @@ def _dedupe_inline_citations(answer: str) -> str:
     return text.strip()
 
 
+def _llm_provider() -> str:
+    return str(getattr(settings, "llm_provider", "openai") or "openai").strip().lower()
+
+
+def _bedrock_region() -> str:
+    region = (getattr(settings, "bedrock_region", "") or "").strip()
+    if region:
+        return region
+    fallback = (getattr(settings, "aws_region", "") or "").strip()
+    if fallback:
+        return fallback
+    raise ValueError("Bedrock region missing. Set BEDROCK_REGION or AWS_REGION.")
+
+
+def _extract_bedrock_output_text(response_payload: dict) -> str:
+    output = response_payload.get("output", {})
+    message = output.get("message", {})
+    content = message.get("content", [])
+    parts: list[str] = []
+    for block in content:
+        text = block.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts).strip()
+
+
+def _synthesize_with_bedrock_sync(instructions: str, user_prompt: str) -> str:
+    import boto3
+
+    client = boto3.client("bedrock-runtime", region_name=_bedrock_region())
+    model_id = (getattr(settings, "bedrock_model_id", "") or "").strip()
+    if not model_id:
+        raise ValueError("BEDROCK_MODEL_ID is required when LLM_PROVIDER=bedrock.")
+
+    request_payload: dict = {
+        "modelId": model_id,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"text": user_prompt}],
+            }
+        ],
+        "inferenceConfig": {
+            "maxTokens": int(getattr(settings, "bedrock_max_tokens", 1200)),
+            "temperature": float(getattr(settings, "bedrock_temperature", 0.2)),
+            "topP": float(getattr(settings, "bedrock_top_p", 0.9)),
+        },
+    }
+    if instructions.strip():
+        request_payload["system"] = [{"text": instructions}]
+
+    response = client.converse(**request_payload)
+    return _extract_bedrock_output_text(response)
+
+
 async def synthesize_answer(query: str, hits: list[QueryHit]) -> tuple[str | None, str, str | None]:
     if not hits:
         return "No relevant information found in retrieved context.", "no_hits", None
@@ -236,35 +292,47 @@ async def synthesize_answer(query: str, hits: list[QueryHit]) -> tuple[str | Non
         f"{_build_context_with_filter(hits=hits, relevant_image_chunk_ids=(relevant_image_ids if diagram_requested else None))}"
     )
 
-    payload = {
-        "model": settings.openai_model,
-        "instructions": instructions,
-        "input": [
-            {
-                "role": "user",
-                "content": user_prompt,
-            }
-        ],
-    }
+    provider = _llm_provider()
+    model_name: str | None = None
 
-    endpoint = settings.openai_base_url.rstrip("/") + "/responses"
-    headers = {"Content-Type": "application/json"}
-    if settings.openai_api_key:
-        headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+    if provider == "bedrock":
+        model_name = (getattr(settings, "bedrock_model_id", "") or "").strip() or "bedrock"
+        try:
+            answer = await asyncio.to_thread(_synthesize_with_bedrock_sync, instructions, user_prompt)
+        except Exception:
+            return None, "llm_error", model_name
+    else:
+        model_name = settings.openai_model
+        payload = {
+            "model": settings.openai_model,
+            "instructions": instructions,
+            "input": [
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                }
+            ],
+        }
 
-    try:
-        async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
-            response = await client.post(endpoint, headers=headers, content=json.dumps(payload))
-            response.raise_for_status()
-            response_payload = response.json()
-    except httpx.HTTPError:
-        return None, "llm_error", settings.openai_model
+        endpoint = settings.openai_base_url.rstrip("/") + "/responses"
+        headers = {"Content-Type": "application/json"}
+        if settings.openai_api_key:
+            headers["Authorization"] = f"Bearer {settings.openai_api_key}"
 
-    answer = _extract_output_text(response_payload)
+        try:
+            async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as client:
+                response = await client.post(endpoint, headers=headers, content=json.dumps(payload))
+                response.raise_for_status()
+                response_payload = response.json()
+        except httpx.HTTPError:
+            return None, "llm_error", model_name
+
+        answer = _extract_output_text(response_payload)
+
     if not answer:
-        return None, "llm_error", settings.openai_model
+        return None, "llm_error", model_name
 
     answer = _suppress_false_diagram_fallback(answer=answer, has_relevant_images=bool(relevant_images))
     answer = _dedupe_inline_citations(answer)
 
-    return answer, "generated", settings.openai_model
+    return answer, "generated", model_name

@@ -49,6 +49,14 @@ async def startup_event() -> None:
     if openai_required and not key_present:
         logger.warning("OPENAI_API_KEY is missing but provider requires OpenAI.")
 
+    qdrant_host = str(getattr(settings, "qdrant_host", "") or "").strip().lower()
+    if qdrant_host in {"localhost", "127.0.0.1"}:
+        logger.warning(
+            "QDRANT_HOST is set to '%s'. In ECS/Fargate this usually breaks semantic retrieval. "
+            "Set QDRANT_HOST to your Qdrant Cloud host and QDRANT_HTTPS=true.",
+            qdrant_host,
+        )
+
     qdrant_state, qdrant_detail = qdrant_health()
     if qdrant_state == "up":
         logger.info("Qdrant Vector DB status: UP (%s)", qdrant_detail)

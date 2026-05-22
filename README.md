@@ -78,6 +78,34 @@ After this, replace localhost endpoints with ALB DNS:
 - `POST https://<ALB_DNS>/v1/ingest/pdf?pipeline=hf`
 - `POST https://<ALB_DNS>/v1/agentic/query`
 
+### No-console deploy after push (register revision + force deploy)
+After pushing a new API image, run one command from repo root:
+
+`powershell -ExecutionPolicy Bypass -File scripts/deploy_ecs_api.ps1 -Region ap-south-1 -Cluster rag-cluster -Service rag-api-service-call -WaitStable`
+
+Optional image override at deploy time:
+
+`powershell -ExecutionPolicy Bypass -File scripts/deploy_ecs_api.ps1 -Image 053849129634.dkr.ecr.ap-south-1.amazonaws.com/rag-api-service:latest -WaitStable`
+
+Recommended for cloud Qdrant runtime (prevents `vector_status: unavailable` from localhost misconfig):
+
+`powershell -ExecutionPolicy Bypass -File scripts/deploy_ecs_api.ps1 -Region ap-south-1 -Cluster rag-cluster -Service rag-api-service-call -Image 053849129634.dkr.ecr.ap-south-1.amazonaws.com/rag-api-service:latest -SetEnv "QDRANT_HOST=732c3e66-00c9-481f-8673-eaac403512b9.eu-west-2-0.aws.cloud.qdrant.io","QDRANT_PORT=6333","QDRANT_HTTPS=true","QDRANT_COLLECTION=rag_chunks","HF_QDRANT_COLLECTION=rag_chunks_hf","FORCE_HF_RETRIEVAL_COLLECTION=true" -WaitStable`
+
+This automation does:
+1. Registers a new task definition revision using `infra/ecs-api-task-definition.json`.
+2. Updates ECS service with the new revision.
+3. Forces a new deployment.
+4. Optionally waits until service is stable.
+
+### Fully automated build + push + deploy
+Single command (no manual Step 9/10 in console):
+
+`powershell -ExecutionPolicy Bypass -File scripts/push_and_deploy_api.ps1 -Region ap-south-1 -AccountId 053849129634 -Repository rag-api-service -Cluster rag-cluster -Service rag-api-service-call -Tag latest -WaitStable`
+
+Cloud Qdrant override variant:
+
+`powershell -ExecutionPolicy Bypass -File scripts/push_and_deploy_api.ps1 -Region ap-south-1 -AccountId 053849129634 -Repository rag-api-service -Cluster rag-cluster -Service rag-api-service-call -Tag latest -SetEnv "QDRANT_HOST=732c3e66-00c9-481f-8673-eaac403512b9.eu-west-2-0.aws.cloud.qdrant.io","QDRANT_PORT=6333","QDRANT_HTTPS=true","QDRANT_COLLECTION=rag_chunks","HF_QDRANT_COLLECTION=rag_chunks_hf","FORCE_HF_RETRIEVAL_COLLECTION=true" -WaitStable`
+
 Recommended with cloud worker:
 - API task env: `AUTO_START_ASYNC_WORKER=false`
 - Worker remains separate ECS service (`rag-ingestion-worker`)
@@ -185,3 +213,15 @@ Install eval dependencies:
 Recommended usage:
 - Use `RAGAS` reports for tuning loops and model/retriever diagnostics.
 - Use `DeepEval` with `--fail-on-gate` in CI before deployment.
+
+
+powershell -ExecutionPolicy Bypass -File scripts/push_and_deploy_api.ps1 `
+  -Region ap-south-1 `
+  -AccountId 053849129634 `
+  -Repository rag-api-service `
+  -Cluster rag-cluster `
+  -Service rag-api-service-call `
+  -Tag latest `
+  -SetEnv QDRANT_HOST=732c3e66-00c9-481f-8673-eaac403512b9.eu-west-2-0.aws.cloud.qdrant.io,QDRANT_PORT=6333,QDRANT_HTTPS=true,QDRANT_COLLECTION=rag_chunks,HF_QDRANT_COLLECTION=rag_chunks_hf,FORCE_HF_RETRIEVAL_COLLECTION=true,LLM_PROVIDER=bedrock,EMBEDDING_PROVIDER=bedrock `
+  -WaitStable
+  GET http://rag-api-service-alb-1120877346.ap-south-1.elb.amazonaws.com/health
