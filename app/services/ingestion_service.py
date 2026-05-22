@@ -1,11 +1,13 @@
 import hashlib
 import asyncio
+import json
 from pathlib import Path
 import re
 from typing import Any, Literal
 import uuid
 
 from fastapi import HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pypdf import PdfReader
 
 from app.core.config import settings
@@ -253,6 +255,51 @@ async def _wait_for_job_terminal_state(job_id: str) -> dict | None:
         if asyncio.get_running_loop().time() >= deadline:
             return None
         await asyncio.sleep(poll_seconds)
+
+
+def _job_progress_from_item(item: dict | None) -> tuple[str, int, str]:
+    if not isinstance(item, dict):
+        return "unknown", 0, ""
+
+    status = str(item.get("status", "unknown") or "unknown").strip().lower()
+    phase = str(item.get("phase", "") or "").strip().lower()
+    status_message = str(item.get("status_message", "") or "").strip()
+
+    raw_progress = item.get("progress_percent", None)
+    progress = 0
+    if isinstance(raw_progress, (int, float)):
+        progress = int(raw_progress)
+    elif isinstance(raw_progress, str) and raw_progress.strip().isdigit():
+        progress = int(raw_progress.strip())
+
+    progress = max(0, min(100, progress))
+
+    if progress == 0:
+        if status == "queued":
+            progress = 5
+        elif status == "processing":
+            progress = 20
+        elif status in {"completed", "failed"}:
+            progress = 100
+
+    if not phase:
+        phase = status or "unknown"
+
+    if not status_message:
+        defaults = {
+            "queued": "Ingestion queued.",
+            "processing": "Ingestion in progress.",
+            "completed": "Ingestion completed.",
+            "failed": "Ingestion failed.",
+            "unknown": "Awaiting job visibility.",
+        }
+        status_message = defaults.get(status, "Ingestion status update.")
+
+    return phase, progress, status_message
+
+
+def _sse_event(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=True)}\n\n"
 
 
 async def _save_upload(file: UploadFile, destination: Path) -> tuple[int, str]:
@@ -745,6 +792,138 @@ async def ingest_pdf(
     )
 
 
+async def ingest_pdf_stream(
+    file: UploadFile,
+    pipeline: Literal["auto", "legacy", "hf"] = "auto",
+    async_mode: bool | None = None,
+) -> StreamingResponse:
+    accepted = await ingest_pdf(
+        file=file,
+        pipeline=pipeline,
+        async_mode=async_mode,
+        wait_for_completion=False,
+    )
+    if isinstance(accepted, IngestionResponse):
+        async def immediate_generator():
+            yield _sse_event(
+                "started",
+                {
+                    "status": "started",
+                    "message": "Ingestion started in synchronous mode.",
+                    "progress_percent": 10,
+                    "phase": "processing",
+                    "doc_id": accepted.doc_id,
+                    "source_file": accepted.source_file,
+                },
+            )
+            yield _sse_event(
+                "completed",
+                {
+                    "status": "completed",
+                    "message": "Ingestion completed.",
+                    "progress_percent": 100,
+                    "phase": "completed",
+                    "doc_id": accepted.doc_id,
+                    "source_file": accepted.source_file,
+                    "result": accepted.model_dump(),
+                },
+            )
+            yield _sse_event("done", {"status": "done"})
+
+        return StreamingResponse(immediate_generator(), media_type="text/event-stream")
+
+    poll_seconds = max(0.5, float(settings.async_wait_poll_seconds))
+
+    async def event_generator():
+        job_id = accepted.job_id
+        yield _sse_event(
+            "started",
+            {
+                "status": "accepted",
+                "message": "Ingestion started and queued.",
+                "progress_percent": 5,
+                "phase": "queued",
+                "job_id": job_id,
+                "doc_id": accepted.doc_id,
+                "source_file": accepted.source_file,
+                "queue": accepted.queue,
+            },
+        )
+
+        last_signature = ""
+        while True:
+            item, ok, error = _aws_async_service.get_job(job_id=job_id)
+            if not ok:
+                yield _sse_event(
+                    "error",
+                    {
+                        "status": "error",
+                        "message": "Could not fetch job status.",
+                        "reason": error or "job_status_unavailable",
+                        "job_id": job_id,
+                    },
+                )
+                break
+
+            if item is None:
+                current = {
+                    "status": "queued",
+                    "phase": "queued",
+                    "progress_percent": 5,
+                    "status_message": "Job accepted and awaiting worker pickup.",
+                }
+            else:
+                status = str(item.get("status", "unknown")).strip().lower() or "unknown"
+                phase, progress, status_message = _job_progress_from_item(item)
+                current = {
+                    "status": status,
+                    "phase": phase,
+                    "progress_percent": progress,
+                    "status_message": status_message,
+                }
+
+            signature = f"{current['status']}::{current['phase']}::{current['progress_percent']}::{current['status_message']}"
+            if signature != last_signature:
+                payload = {
+                    "job_id": job_id,
+                    "doc_id": accepted.doc_id,
+                    "source_file": accepted.source_file,
+                    **current,
+                }
+                if item is not None and isinstance(item.get("result", {}), dict) and current["status"] == "completed":
+                    payload["result"] = item.get("result", {})
+                yield _sse_event("progress", payload)
+                last_signature = signature
+
+            if current["status"] in {"completed", "failed"}:
+                if current["status"] == "completed":
+                    yield _sse_event("completed", {"job_id": job_id, **current})
+                else:
+                    fail_reason = ""
+                    if isinstance(item, dict):
+                        fail_reason = str(item.get("error", "") or "")
+                    yield _sse_event(
+                        "failed",
+                        {
+                            "job_id": job_id,
+                            **current,
+                            "error": fail_reason,
+                        },
+                    )
+                break
+
+            await asyncio.sleep(poll_seconds)
+
+        yield _sse_event("done", {"status": "done", "job_id": accepted.job_id})
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
+
+
 def get_ingestion_job_status(job_id: str) -> IngestionJobStatusResponse:
     item, ok, error = _aws_async_service.get_job(job_id=job_id)
     if not ok:
@@ -762,10 +941,14 @@ def get_ingestion_job_status(job_id: str) -> IngestionJobStatusResponse:
     status = str(item.get("status", "unknown")).strip().lower() or "unknown"
     if status not in {"queued", "processing", "completed", "failed", "unknown"}:
         status = "unknown"
+    phase, progress_percent, status_message = _job_progress_from_item(item)
 
     return IngestionJobStatusResponse(
         job_id=str(item.get("job_id", job_id)),
         status=status,
+        phase=phase,
+        progress_percent=progress_percent,
+        status_message=status_message,
         doc_id=str(item.get("doc_id", "")) or None,
         source_file=str(item.get("source_file", "")) or None,
         pipeline=str(item.get("pipeline", "")) or None,

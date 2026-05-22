@@ -1,4 +1,5 @@
 import re
+from collections import defaultdict
 
 from app.schemas.agentic import RetrievalGuardrailReport
 from app.services.retrieval_types import RetrievalCandidate
@@ -20,7 +21,24 @@ def _extract_years(text: str) -> set[int]:
     return years
 
 
-def apply_retrieval_guardrails(candidates: list[RetrievalCandidate]) -> tuple[list[RetrievalCandidate], RetrievalGuardrailReport]:
+def _query_requires_single_document_scope(query: str) -> bool:
+    lowered = (query or "").lower()
+    markers = [
+        "uploaded document",
+        "uploaded pdf",
+        "as mentioned in document",
+        "as mentioned in the document",
+        "from the uploaded",
+        "from uploaded document",
+        "in the document",
+    ]
+    return any(marker in lowered for marker in markers)
+
+
+def apply_retrieval_guardrails(
+    candidates: list[RetrievalCandidate],
+    query: str = "",
+) -> tuple[list[RetrievalCandidate], RetrievalGuardrailReport]:
     blocked_sources: list[str] = []
     stale_warnings: list[str] = []
 
@@ -31,6 +49,19 @@ def apply_retrieval_guardrails(candidates: list[RetrievalCandidate]) -> tuple[li
             blocked_sources.append(candidate.source_file)
             continue
         kept.append(candidate)
+
+    if kept and _query_requires_single_document_scope(query):
+        score_by_source: dict[str, float] = defaultdict(float)
+        count_by_source: dict[str, int] = defaultdict(int)
+        for item in kept:
+            score_by_source[item.source_file] += float(item.rerank_score)
+            count_by_source[item.source_file] += 1
+
+        dominant_source = max(
+            score_by_source.keys(),
+            key=lambda src: (score_by_source[src], count_by_source[src]),
+        )
+        kept = [item for item in kept if item.source_file == dominant_source]
 
     conflicts: list[str] = []
     if len(kept) >= 2:

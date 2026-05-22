@@ -41,11 +41,15 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
+    openai_model_secondary: str = ""
     embedding_model: str = "text-embedding-3-small"
     llm_provider: str = "openai"
+    llm_provider_secondary: str = ""
+    enable_dual_llm_synthesis: bool = False
     embedding_provider: str = "openai"
     bedrock_region: str = ""
     bedrock_model_id: str = "anthropic.claude-3-5-haiku-20241022-v1:0"
+    bedrock_model_id_secondary: str = ""
     bedrock_embedding_model_id: str = "amazon.titan-embed-text-v2:0"
     bedrock_temperature: float = 0.2
     bedrock_top_p: float = 0.9

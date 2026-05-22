@@ -120,6 +120,16 @@ class AsyncIngestionWorker:
         if not ok:
             LOGGER.error("job_status_update_failed job_id=%s reason=%s", job_id, mark_error)
 
+    def _mark_progress(self, *, job_id: str, phase: str, progress: int, message: str) -> None:
+        ok, progress_error = self.async_service.update_job_progress(
+            job_id=job_id,
+            phase=phase,
+            progress_percent=progress,
+            status_message=message,
+        )
+        if not ok:
+            LOGGER.warning("job_progress_update_failed job_id=%s phase=%s reason=%s", job_id, phase, progress_error)
+
     def _handle_message(self, message: dict) -> None:
         receipt_handle = str(message.get("ReceiptHandle", "")).strip()
         attributes = message.get("Attributes", {}) if isinstance(message.get("Attributes", {}), dict) else {}
@@ -169,18 +179,32 @@ class AsyncIngestionWorker:
         ok, processing_error = self.async_service.mark_job_processing(job_id=job_id, worker_id=self.worker_id)
         if not ok:
             LOGGER.warning("mark_processing_failed job_id=%s reason=%s", job_id, processing_error)
+        self._mark_progress(job_id=job_id, phase="processing", progress=15, message="Worker picked up job from queue.")
 
         local_pdf_path: Path | None = None
         try:
+            self._mark_progress(job_id=job_id, phase="downloading", progress=25, message="Downloading PDF from S3.")
             local_pdf_path = self._download_pdf(
                 bucket=s3_bucket,
                 key=s3_key,
                 job_id=job_id,
                 source_file=source_file,
             )
+            self._mark_progress(
+                job_id=job_id,
+                phase="downloaded",
+                progress=35,
+                message="PDF downloaded. Starting extraction and indexing.",
+            )
             resolved_sha = file_sha256 or _sha256_file(local_pdf_path)
             file_size = int(local_pdf_path.stat().st_size)
 
+            self._mark_progress(
+                job_id=job_id,
+                phase="indexing",
+                progress=70,
+                message="Running chunking, enrichment, embeddings, and vector indexing.",
+            )
             response = asyncio.run(
                 process_saved_pdf(
                     file_path=local_pdf_path,
@@ -193,6 +217,12 @@ class AsyncIngestionWorker:
                 )
             )
 
+            self._mark_progress(
+                job_id=job_id,
+                phase="finalizing",
+                progress=90,
+                message="Persisting ingestion result to job store.",
+            )
             result = {
                 "doc_id": response.doc_id,
                 "source_file": response.source_file,

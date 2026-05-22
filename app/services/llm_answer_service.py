@@ -1,12 +1,14 @@
 import asyncio
 import json
 import re
+import logging
 
 import httpx
 
 from app.core.config import settings
 from app.schemas.ingestion import QueryHit
 
+logger = logging.getLogger(__name__)
 
 def _extract_output_text(payload: dict) -> str:
     output_text = payload.get("output_text")
@@ -76,9 +78,23 @@ def _length_hint(query: str) -> str:
     return ""
 
 
-def _response_style_hint(query: str) -> str:
+def _response_style_hint(query: str, response_format: str = "auto") -> str:
+    format_mode = (response_format or "auto").strip().lower()
+    if format_mode == "table":
+        return (
+            "Output format: return a compact plain-text table with columns and rows. "
+            "Use one row per item/fact and cite each row at the end in parentheses."
+        )
+    if format_mode == "points":
+        return (
+            "Output format: provide three parts in plain text labels: Basic Info, Detailed Insights, Conclusion. "
+            "Use bullet points in Basic Info and Detailed Insights. "
+            "Conclusion should be 2-3 concise sentences."
+        )
+
     lowered = query.lower()
     list_only_markers = ["give list", "list of", "table of", "winners list"]
+    tabular_markers = ["compare", "comparison", "difference between", "vs", "versus", "table"]
     explanatory_markers = [
         "explain",
         "describe",
@@ -93,12 +109,21 @@ def _response_style_hint(query: str) -> str:
     is_list_only = any(marker in lowered for marker in list_only_markers) and not any(
         marker in lowered for marker in ["explain", "describe", "overview", "analysis"]
     )
+    is_tabular = any(marker in lowered for marker in tabular_markers)
     is_explanatory = any(marker in lowered for marker in explanatory_markers)
+
+    if is_tabular:
+        return (
+            "Output format: return a compact plain-text table with columns and rows. "
+            "Use one row per item/fact and cite each row at the end in parentheses."
+        )
 
     if is_list_only:
         return (
             "Output format: return only the requested list, with no intro or conclusion. "
-            "Keep each bullet factual and concise."
+            "Keep each bullet factual and concise. "
+            "Do not combine unrelated clauses into the same bullet. "
+            "If item names are not explicitly present in evidence, say list is incomplete from local evidence."
         )
 
     if is_explanatory:
@@ -176,6 +201,14 @@ def _diagram_instruction(query: str, relevant_images: list[QueryHit]) -> str:
     return "If no image evidence exists in context, explicitly state: 'Insufficient local evidence for a diagram.'"
 
 
+def _image_retrieval_hint(query: str, relevant_images: list[QueryHit]) -> str:
+    if not _diagram_requested(query):
+        return ""
+    if relevant_images:
+        return "Prioritize image-grounded explanation when visual evidence exists."
+    return "Do not invent diagram details when no image evidence is retrieved."
+
+
 def _suppress_false_diagram_fallback(answer: str, has_relevant_images: bool) -> str:
     if not has_relevant_images:
         return answer
@@ -200,6 +233,24 @@ def _dedupe_inline_citations(answer: str) -> str:
     text = re.sub(r"\(\s+\)", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _compact_hits_for_retry(hits: list[QueryHit], max_hits: int = 3, max_chars: int = 320) -> list[QueryHit]:
+    compact: list[QueryHit] = []
+    for hit in hits[: max(1, max_hits)]:
+        base = (hit.snippet or hit.text or "").strip()
+        base = re.sub(r"\s+", " ", base).strip()
+        if len(base) > max_chars:
+            base = base[: max_chars - 3] + "..."
+        compact.append(
+            hit.model_copy(
+                update={
+                    "snippet": base,
+                    "text": None,
+                }
+            )
+        )
+    return compact
 
 
 def _llm_provider() -> str:
@@ -228,11 +279,11 @@ def _extract_bedrock_output_text(response_payload: dict) -> str:
     return "\n".join(parts).strip()
 
 
-def _synthesize_with_bedrock_sync(instructions: str, user_prompt: str) -> str:
+def _synthesize_with_bedrock_sync(instructions: str, user_prompt: str, model_id_override: str | None = None) -> str:
     import boto3
 
     client = boto3.client("bedrock-runtime", region_name=_bedrock_region())
-    model_id = (getattr(settings, "bedrock_model_id", "") or "").strip()
+    model_id = (model_id_override or getattr(settings, "bedrock_model_id", "") or "").strip()
     if not model_id:
         raise ValueError("BEDROCK_MODEL_ID is required when LLM_PROVIDER=bedrock.")
 
@@ -257,7 +308,13 @@ def _synthesize_with_bedrock_sync(instructions: str, user_prompt: str) -> str:
     return _extract_bedrock_output_text(response)
 
 
-async def synthesize_answer(query: str, hits: list[QueryHit]) -> tuple[str | None, str, str | None]:
+async def synthesize_answer(
+    query: str,
+    hits: list[QueryHit],
+    response_format: str = "auto",
+    provider_override: str | None = None,
+    model_override: str | None = None,
+) -> tuple[str | None, str, str | None]:
     if not hits:
         return "No relevant information found in retrieved context.", "no_hits", None
 
@@ -266,8 +323,9 @@ async def synthesize_answer(query: str, hits: list[QueryHit]) -> tuple[str | Non
     relevant_image_ids = {hit.chunk_id for hit in relevant_images}
 
     length_hint = _length_hint(query)
-    style_hint = _response_style_hint(query)
+    style_hint = _response_style_hint(query, response_format=response_format)
     diagram_hint = _diagram_instruction(query, relevant_images)
+    image_hint = _image_retrieval_hint(query, relevant_images)
     instructions = (
         "You are a strict production RAG answer engine. "
         "Answer only from provided context. "
@@ -279,37 +337,53 @@ async def synthesize_answer(query: str, hits: list[QueryHit]) -> tuple[str | Non
         "Cite every bullet or sentence with exact IDs like (chunk_00004 p5-8) or (image_00018 p5-5). "
         "Do not output placeholders like chunk_id. "
         "Do not include citations that are not used in the answer. "
+        "Keep the writing production-grade: clear structure, concise reasoning, and no OCR artifacts. "
         f"{style_hint} "
-        f"{diagram_hint}"
+        f"{diagram_hint} "
+        f"{image_hint}"
     )
 
     length_line = f"{length_hint}\n\n" if length_hint else ""
-    user_prompt = (
-        f"User query: {query}\n\n"
-        f"{length_line}"
-        "Retrieved context follows.\n"
-        "Use it to produce the final answer.\n\n"
-        f"{_build_context_with_filter(hits=hits, relevant_image_chunk_ids=(relevant_image_ids if diagram_requested else None))}"
+    def _build_user_prompt(context_hits: list[QueryHit]) -> str:
+        return (
+            f"User query: {query}\n\n"
+            f"{length_line}"
+            "Retrieved context follows.\n"
+            "Use it to produce the final answer.\n\n"
+            f"{_build_context_with_filter(hits=context_hits, relevant_image_chunk_ids=(relevant_image_ids if diagram_requested else None))}"
+        )
+
+    user_prompt = _build_user_prompt(hits)
+
+    provider = (provider_override or _llm_provider() or "openai").strip().lower()
+    model_name: str | None = None
+    retry_instruction_suffix = (
+        "Retry mode: produce a concise synthesis from the compact evidence only. "
+        "Prefer definition, contrast, and applications over long quotations."
     )
 
-    provider = _llm_provider()
-    model_name: str | None = None
+    async def _run_once(active_instructions: str, active_prompt: str) -> tuple[str | None, str | None]:
+        nonlocal model_name
+        if provider == "bedrock":
+            model_name = (model_override or getattr(settings, "bedrock_model_id", "") or "").strip() or "bedrock"
+            try:
+                return await asyncio.to_thread(
+                    _synthesize_with_bedrock_sync,
+                    active_instructions,
+                    active_prompt,
+                    model_override,
+                ), None
+            except Exception as exc:
+                return None, str(exc)
 
-    if provider == "bedrock":
-        model_name = (getattr(settings, "bedrock_model_id", "") or "").strip() or "bedrock"
-        try:
-            answer = await asyncio.to_thread(_synthesize_with_bedrock_sync, instructions, user_prompt)
-        except Exception:
-            return None, "llm_error", model_name
-    else:
-        model_name = settings.openai_model
+        model_name = (model_override or settings.openai_model or "").strip() or settings.openai_model
         payload = {
-            "model": settings.openai_model,
-            "instructions": instructions,
+            "model": model_name,
+            "instructions": active_instructions,
             "input": [
                 {
                     "role": "user",
-                    "content": user_prompt,
+                    "content": active_prompt,
                 }
             ],
         }
@@ -324,10 +398,26 @@ async def synthesize_answer(query: str, hits: list[QueryHit]) -> tuple[str | Non
                 response = await client.post(endpoint, headers=headers, content=json.dumps(payload))
                 response.raise_for_status()
                 response_payload = response.json()
-        except httpx.HTTPError:
-            return None, "llm_error", model_name
+            return _extract_output_text(response_payload), None
+        except httpx.HTTPError as exc:
+            return None, str(exc)
 
-        answer = _extract_output_text(response_payload)
+    answer, first_error = await _run_once(instructions, user_prompt)
+    if not answer:
+        if first_error:
+            logger.warning("llm_synthesis_first_attempt_failed model=%s reason=%s", model_name, first_error)
+        compact_hits = _compact_hits_for_retry(hits=hits, max_hits=min(3, len(hits)))
+        compact_prompt = _build_user_prompt(compact_hits)
+        retry_instructions = f"{instructions} {retry_instruction_suffix}"
+        answer, second_error = await _run_once(retry_instructions, compact_prompt)
+        if not answer:
+            logger.warning(
+                "llm_synthesis_retry_failed model=%s first_reason=%s retry_reason=%s",
+                model_name,
+                first_error,
+                second_error,
+            )
+            return None, "llm_error", model_name
 
     if not answer:
         return None, "llm_error", model_name

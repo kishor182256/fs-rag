@@ -38,7 +38,11 @@ async def run_query_pipeline(request: QueryRequest) -> QueryResponse:
         result.answer_status = "disabled"
         return result
 
-    answer, status, model = await synthesize_answer(request.query, result.hits)
+    answer, status, model = await synthesize_answer(
+        request.query,
+        result.hits,
+        response_format=request.response_format,
+    )
     result.answer = answer
     result.answer_status = status
     result.answer_model = model

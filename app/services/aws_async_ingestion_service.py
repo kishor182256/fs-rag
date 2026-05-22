@@ -141,6 +141,9 @@ class AwsAsyncIngestionService:
         item = {
             "job_id": job_id,
             "status": "queued",
+            "phase": "queued",
+            "progress_percent": 5,
+            "status_message": "Ingestion job queued.",
             "created_at": now,
             "updated_at": now,
             "doc_id": doc_id,
@@ -208,10 +211,13 @@ class AwsAsyncIngestionService:
         try:
             self._table().update_item(
                 Key=self._job_key(job_id),
-                UpdateExpression="SET #s=:s, worker_id=:w, #err=:e, updated_at=:u",
+                UpdateExpression="SET #s=:s, phase=:p, progress_percent=:pp, status_message=:m, worker_id=:w, #err=:e, updated_at=:u",
                 ExpressionAttributeNames={"#s": "status", "#err": "error"},
                 ExpressionAttributeValues={
                     ":s": "processing",
+                    ":p": "processing",
+                    ":pp": 15,
+                    ":m": "Worker started processing.",
                     ":w": (worker_id or "").strip(),
                     ":e": "",
                     ":u": _utc_now_iso(),
@@ -228,10 +234,13 @@ class AwsAsyncIngestionService:
         try:
             self._table().update_item(
                 Key=self._job_key(job_id),
-                UpdateExpression="SET #s=:s, #err=:e, updated_at=:u",
+                UpdateExpression="SET #s=:s, phase=:p, progress_percent=:pp, status_message=:m, #err=:e, updated_at=:u",
                 ExpressionAttributeNames={"#s": "status", "#err": "error"},
                 ExpressionAttributeValues={
                     ":s": "failed",
+                    ":p": "failed",
+                    ":pp": 100,
+                    ":m": "Ingestion failed.",
                     ":e": (error or "unknown_error")[:1200],
                     ":u": _utc_now_iso(),
                 },
@@ -248,12 +257,45 @@ class AwsAsyncIngestionService:
         try:
             self._table().update_item(
                 Key=self._job_key(job_id),
-                UpdateExpression="SET #s=:s, #res=:r, #err=:e, updated_at=:u",
+                UpdateExpression="SET #s=:s, phase=:p, progress_percent=:pp, status_message=:m, #res=:r, #err=:e, updated_at=:u",
                 ExpressionAttributeNames={"#s": "status", "#res": "result", "#err": "error"},
                 ExpressionAttributeValues={
                     ":s": "completed",
+                    ":p": "completed",
+                    ":pp": 100,
+                    ":m": "Ingestion completed successfully.",
                     ":r": safe_result,
                     ":e": "",
+                    ":u": _utc_now_iso(),
+                },
+            )
+            return True, ""
+        except Exception as exc:
+            return False, f"dynamodb_update_failed:{exc}"
+
+    def update_job_progress(
+        self,
+        *,
+        job_id: str,
+        phase: str,
+        progress_percent: int,
+        status_message: str = "",
+    ) -> tuple[bool, str]:
+        self._initialize()
+        if not self.is_available():
+            return False, self._init_error or "aws_async_unavailable"
+
+        safe_phase = (phase or "processing").strip().lower()[:64]
+        safe_progress = max(0, min(100, int(progress_percent)))
+        safe_message = (status_message or "").strip()[:300]
+        try:
+            self._table().update_item(
+                Key=self._job_key(job_id),
+                UpdateExpression="SET phase=:p, progress_percent=:pp, status_message=:m, updated_at=:u",
+                ExpressionAttributeValues={
+                    ":p": safe_phase,
+                    ":pp": safe_progress,
+                    ":m": safe_message,
                     ":u": _utc_now_iso(),
                 },
             )

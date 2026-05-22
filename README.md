@@ -122,6 +122,9 @@ Ingest a PDF:
 Ingest with HF pipeline using async S3/SQS path:
 `curl -X POST "http://localhost:8000/v1/ingest/pdf?pipeline=hf" -F "file=@C:/path/doc.pdf"`
 
+Stream async ingestion progress (SSE, includes `progress_percent`):
+`curl -N -X POST "http://localhost:8000/v1/ingest/pdf?pipeline=hf&stream=true" -F "file=@C:/path/doc.pdf"`
+
 Force async explicitly (any pipeline):
 `curl -X POST "http://localhost:8000/v1/ingest/pdf?pipeline=hf&async_mode=true" -F "file=@C:/path/doc.pdf"`
 
@@ -132,11 +135,24 @@ Duplicate protection:
 Query ingested content:
 `curl -X POST "http://localhost:8000/v1/query" -H "Content-Type: application/json" -d "{\"query\":\"RBI repo rate\",\"top_k\":2}"`
 
+Force response format per query:
+- points: `curl -X POST "http://localhost:8000/v1/query" -H "Content-Type: application/json" -d "{\"query\":\"Explain Big Data\",\"response_format\":\"points\"}"`
+- table: `curl -X POST "http://localhost:8000/v1/query" -H "Content-Type: application/json" -d "{\"query\":\"Compare IaaS PaaS SaaS\",\"response_format\":\"table\"}"`
+- auto: `curl -X POST "http://localhost:8000/v1/query" -H "Content-Type: application/json" -d "{\"query\":\"List key highlights\",\"response_format\":\"auto\"}"`
+
 Query text + image evidence together (when multimodal ingest is enabled):
 `curl -X POST "http://localhost:8000/v1/query" -H "Content-Type: application/json" -d "{\"query\":\"show chart trends\",\"top_k\":5,\"use_vector\":true,\"include_images\":true,\"response_mode\":\"full\"}"`
 
 Agentic query:
 `curl -X POST "http://localhost:8000/v1/agentic/query" -H "Content-Type: application/json" -d "{\"query\":\"What is route of Pune Metro Rail Phase-2\",\"top_k\":5,\"use_llm\":true,\"use_vector\":true}"`
+
+Agentic response format control:
+- points: include `"response_format":"points"`
+- table: include `"response_format":"table"`
+- auto: include `"response_format":"auto"`
+
+Agentic response shape:
+- Uses `final_answer` as the single canonical answer field (no duplicate `answer` field).
 
 Agentic text + image evidence:
 `curl -X POST "http://localhost:8000/v1/agentic/query" -H "Content-Type: application/json" -d "{\"query\":\"explain figure on page 12\",\"top_k\":5,\"use_llm\":true,\"use_vector\":true,\"include_images\":true,\"response_mode\":\"full\"}"`
@@ -225,3 +241,12 @@ powershell -ExecutionPolicy Bypass -File scripts/push_and_deploy_api.ps1 `
   -SetEnv QDRANT_HOST=732c3e66-00c9-481f-8673-eaac403512b9.eu-west-2-0.aws.cloud.qdrant.io,QDRANT_PORT=6333,QDRANT_HTTPS=true,QDRANT_COLLECTION=rag_chunks,HF_QDRANT_COLLECTION=rag_chunks_hf,FORCE_HF_RETRIEVAL_COLLECTION=true,LLM_PROVIDER=bedrock,EMBEDDING_PROVIDER=bedrock `
   -WaitStable
   GET http://rag-api-service-alb-1120877346.ap-south-1.elb.amazonaws.com/health
+powershell -ExecutionPolicy Bypass -File scripts/push_and_deploy_api.ps1 `
+  -Region ap-south-1 `
+  -AccountId 053849129634 `
+  -Repository rag-ingestion-worker `
+  -Cluster rag-cluster `
+  -Service rag-ingestion-worker `
+  -Tag latest `
+  -SetEnv QDRANT_HOST=732c3e66-00c9-481f-8673-eaac403512b9.eu-west-2-0.aws.cloud.qdrant.io,QDRANT_PORT=6333,QDRANT_HTTPS=true,QDRANT_COLLECTION=rag_chunks,FORCE_HF_RETRIEVAL_COLLECTION=false,ENABLE_HF_CHUNK_ENRICHMENT=false,LLM_PROVIDER=bedrock,EMBEDDING_PROVIDER=bedrock `
+  -WaitStable

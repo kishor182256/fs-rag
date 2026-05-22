@@ -10,13 +10,20 @@ class AgenticQueryRequest(BaseModel):
     months: list[str] = Field(default_factory=list)
     topics: list[str] = Field(default_factory=list)
     use_vector: bool = True
-    include_images: bool = False
+    include_images: bool = True
     vector_top_k: int = Field(default=8, ge=1, le=40)
     use_llm: bool = True
-    response_mode: Literal["compact", "balanced", "full"] = "compact"
+    response_mode: Literal["compact", "balanced", "full"] = "balanced"
+    response_format: Literal["auto", "points", "table"] = "auto"
     max_snippet_chars: int = Field(default=1200, ge=120, le=4000)
     require_citations: bool = True
     max_corrections: int = Field(default=2, ge=0, le=3)
+    compare_models: bool = False
+    primary_model: str | None = None
+    secondary_model: str | None = None
+    model_provider: Literal["auto", "bedrock", "openai"] = "auto"
+    primary_provider: Literal["auto", "bedrock", "openai"] = "auto"
+    secondary_provider: Literal["auto", "bedrock", "openai"] = "auto"
 
 
 class GuardrailResult(BaseModel):
@@ -78,6 +85,13 @@ class ResponseMetadata(BaseModel):
     grounded: bool = False
 
 
+class ModelOutput(BaseModel):
+    provider: str
+    model: str | None = None
+    status: str
+    answer: str
+
+
 class ImageReference(BaseModel):
     document: str
     page: int
@@ -90,7 +104,6 @@ class ImageReference(BaseModel):
 class AgenticQueryResponse(BaseModel):
     query: str
     status: Literal["completed", "blocked", "abstained", "failed"]
-    answer: str | None = None
     final_answer: str | None = None
     sources: list[ResponseSource] = Field(default_factory=list)
     image_references: list[ImageReference] = Field(default_factory=list)
@@ -103,4 +116,5 @@ class AgenticQueryResponse(BaseModel):
     evidence: list[EvidenceItem] | None = None
     steps: list[AgentStep] | None = None
     answer_model: str | None = None
+    model_outputs: list[ModelOutput] | None = None
     vector_status: Literal["used", "disabled", "unavailable", "error"] = "disabled"

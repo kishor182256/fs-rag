@@ -46,6 +46,9 @@ class IngestionJobAcceptedResponse(BaseModel):
 class IngestionJobStatusResponse(BaseModel):
     job_id: str
     status: Literal["queued", "processing", "completed", "failed", "unknown"]
+    phase: str | None = None
+    progress_percent: int | None = None
+    status_message: str | None = None
     doc_id: str | None = None
     source_file: str | None = None
     pipeline: str | None = None
@@ -67,6 +70,7 @@ class QueryRequest(BaseModel):
     include_images: bool = False
     include_full_text: bool = False
     response_mode: Literal["compact", "balanced", "full"] = "balanced"
+    response_format: Literal["auto", "points", "table"] = "auto"
     max_snippet_chars: int = Field(default=1200, ge=120, le=4000)
 
 

@@ -1,11 +1,22 @@
-from fastapi import FastAPI
+import json
 import logging
 import threading
+import time
+import uuid
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from app.api.router import api_router
 from app.core.config import settings
 from app.services.vector_store_service import qdrant_health
 from app.workers.async_ingestion_worker import AsyncIngestionWorker
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
 
 app = FastAPI(
     title=settings.app_name,
@@ -16,6 +27,64 @@ app.include_router(api_router)
 
 logger = logging.getLogger("uvicorn.error")
 _embedded_worker_thread: threading.Thread | None = None
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        logger.info(
+            json.dumps(
+                {
+                    "event": "http_request",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": response.status_code,
+                    "latency_ms": latency_ms,
+                    "client_ip": request.client.host if request.client else "",
+                },
+                ensure_ascii=True,
+            )
+        )
+        response.headers["X-Request-Id"] = request_id
+        return response
+    except Exception:
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        logger.exception(
+            json.dumps(
+                {
+                    "event": "http_unhandled_exception",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "latency_ms": latency_ms,
+                    "client_ip": request.client.host if request.client else "",
+                },
+                ensure_ascii=True,
+            )
+        )
+        raise
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(
+        json.dumps(
+            {
+                "event": "global_exception_handler",
+                "method": request.method,
+                "path": request.url.path,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            },
+            ensure_ascii=True,
+        )
+    )
+    return JSONResponse(status_code=500, content={"message": "Internal server error"})
 
 
 def _run_embedded_worker() -> None:
