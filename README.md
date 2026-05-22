@@ -59,6 +59,29 @@ Result:
 - ECS worker consumes SQS, processes ingestion, updates DynamoDB, writes to Qdrant.
 - Data becomes queryable through `POST /v1/agentic/query`.
 
+## AWS API deployment (ECS/Fargate + ALB)
+1. Create ECR repository (example: `rag-api-service`).
+2. Build API image from repo root:
+   `docker build -f api.Dockerfile -t rag-api-service:latest .`
+   - `api.Dockerfile` installs from `requirements.api.txt` (lean runtime deps for smaller image size).
+3. Login/tag/push:
+   `aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com`
+   `docker tag rag-api-service:latest <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/rag-api-service:latest`
+   `docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/rag-api-service:latest`
+4. Create API task role and attach policy from `infra/iam-api-task-role-policy.json`.
+5. Register task definition from `infra/ecs-api-task-definition.json`.
+6. Create ALB target group for HTTP port `8000`.
+7. Create ECS service using `infra/ecs-api-service.json` (replace placeholders for cluster/subnets/SG/target group).
+8. Create ALB listener rule to forward API traffic to that target group.
+
+After this, replace localhost endpoints with ALB DNS:
+- `POST https://<ALB_DNS>/v1/ingest/pdf?pipeline=hf`
+- `POST https://<ALB_DNS>/v1/agentic/query`
+
+Recommended with cloud worker:
+- API task env: `AUTO_START_ASYNC_WORKER=false`
+- Worker remains separate ECS service (`rag-ingestion-worker`)
+
 ### Worker image size optimization
 - The worker container intentionally excludes heavy local-ML packages (`sentence-transformers`, `torch`) to keep image size low.
 - This is safe when embeddings/LLM calls are remote (OpenAI/Bedrock/SageMaker).

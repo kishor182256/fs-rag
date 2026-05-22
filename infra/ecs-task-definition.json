@@ -1,0 +1,84 @@
+{
+  "family": "rag-ingestion-worker",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "4096",
+  "executionRoleArn": "arn:aws:iam::053849129634:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::053849129634:role/rag-ingestion-worker-task-role",
+  "containerDefinitions": [
+    {
+      "name": "rag-ingestion-worker",
+      "image": "053849129634.dkr.ecr.ap-south-1.amazonaws.com/rag-ingestion-worker:latest",
+      "essential": true,
+      "command": [
+        "--log-level",
+        "INFO",
+        "--poll-wait-seconds",
+        "20",
+        "--visibility-timeout-seconds",
+        "1800",
+        "--max-messages",
+        "1",
+        "--max-attempts",
+        "3"
+      ],
+      "environment": [
+        { "name": "APP_ENV", "value": "prod" },
+        { "name": "ENABLE_ASYNC_INGESTION", "value": "true" },
+        { "name": "ENABLE_S3_UPLOAD", "value": "true" },
+        { "name": "AUTO_START_ASYNC_WORKER", "value": "false" },
+        { "name": "AWS_REGION", "value": "ap-south-1" },
+        { "name": "S3_BUCKET_NAME", "value": "aws-rag-demos" },
+        { "name": "S3_KEY_PREFIX", "value": "ingestion/raw" },
+        { "name": "SQS_QUEUE_URL", "value": "https://sqs.ap-south-1.amazonaws.com/053849129634/aws-rag-demo-q" },
+        { "name": "DYNAMODB_JOBS_TABLE", "value": "aws-rag-demo-table" },
+        { "name": "DYNAMODB_JOB_PK", "value": "jobid" },
+        { "name": "OPENAI_BASE_URL", "value": "https://api.openai.com/v1" },
+        { "name": "OPENAI_MODEL", "value": "gpt-4o-mini" },
+        { "name": "EMBEDDING_MODEL", "value": "text-embedding-3-small" },
+        { "name": "LLM_PROVIDER", "value": "bedrock" },
+        { "name": "EMBEDDING_PROVIDER", "value": "bedrock" },
+        { "name": "BEDROCK_REGION", "value": "ap-south-1" },
+        { "name": "BEDROCK_MODEL_ID", "value": "anthropic.claude-3-5-haiku-20241022-v1:0" },
+        { "name": "BEDROCK_EMBEDDING_MODEL_ID", "value": "amazon.titan-embed-text-v2:0" },
+        { "name": "BEDROCK_TEMPERATURE", "value": "0.2" },
+        { "name": "BEDROCK_TOP_P", "value": "0.9" },
+        { "name": "BEDROCK_MAX_TOKENS", "value": "1200" },
+        { "name": "ENABLE_HF_CHUNK_ENRICHMENT", "value": "false" },
+        { "name": "ENABLE_SAGEMAKER_ENRICHMENT", "value": "true" },
+        { "name": "SAGEMAKER_ENDPOINT_NAME", "value": "<SAGEMAKER_ENDPOINT_NAME>" },
+        { "name": "SAGEMAKER_REGION", "value": "ap-south-1" },
+        { "name": "HF_TOPIC_MODEL_NAME", "value": "facebook/bart-large-mnli" },
+        { "name": "HF_NER_MODEL_NAME", "value": "dslim/bert-base-NER" },
+        { "name": "ENABLE_MULTIMODAL_INGEST", "value": "true" },
+        { "name": "ENABLE_VLM_CAPTIONS", "value": "false" },
+        { "name": "ENABLE_CLIP_IMAGE_VECTORS", "value": "false" },
+        { "name": "QDRANT_HOST", "value": "732c3e66-00c9-481f-8673-eaac403512b9.eu-west-2-0.aws.cloud.qdrant.io" },
+        { "name": "QDRANT_PORT", "value": "6333" },
+        { "name": "QDRANT_HTTPS", "value": "true" },
+        { "name": "QDRANT_COLLECTION", "value": "rag_chunks" },
+        { "name": "HF_QDRANT_COLLECTION", "value": "rag_chunks_hf" },
+        { "name": "FORCE_HF_RETRIEVAL_COLLECTION", "value": "true" }
+      ],
+      "secrets": [
+        {
+          "name": "OPENAI_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:053849129634:secret:openai-api-key-L6UVPr"
+        },
+        {
+          "name": "QDRANT_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:053849129634:secret:qdrant-api-key:QDRANT_API_KEY::"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/rag-ingestion-worker",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

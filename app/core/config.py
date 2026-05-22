@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
+    llm_provider: str = "openai"
+    embedding_provider: str = "openai"
+    bedrock_region: str = ""
+    bedrock_model_id: str = "anthropic.claude-3-5-haiku-20241022-v1:0"
+    bedrock_embedding_model_id: str = "amazon.titan-embed-text-v2:0"
+    bedrock_temperature: float = 0.2
+    bedrock_top_p: float = 0.9
+    bedrock_max_tokens: int = 1200
     llm_timeout_seconds: int = 30
     embedding_timeout_seconds: int = 30
     enable_multimodal_ingest: bool = False

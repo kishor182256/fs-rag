@@ -33,16 +33,21 @@ def _run_embedded_worker() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    llm_provider = str(getattr(settings, "llm_provider", "openai") or "openai").strip().lower()
+    embedding_provider = str(getattr(settings, "embedding_provider", "openai") or "openai").strip().lower()
+    openai_required = llm_provider == "openai" or embedding_provider == "openai"
     key_present = bool((settings.openai_api_key or "").strip())
     logger.info(
-        "OpenAI config: base_url=%s model=%s embedding_model=%s api_key_present=%s",
+        "Provider config: llm_provider=%s embedding_provider=%s openai_base_url=%s openai_model=%s embedding_model=%s openai_api_key_present=%s",
+        llm_provider,
+        embedding_provider,
         settings.openai_base_url,
         settings.openai_model,
         settings.embedding_model,
         key_present,
     )
-    if not key_present:
-        logger.warning("OPENAI_API_KEY is missing. LLM/embedding calls will fail.")
+    if openai_required and not key_present:
+        logger.warning("OPENAI_API_KEY is missing but provider requires OpenAI.")
 
     qdrant_state, qdrant_detail = qdrant_health()
     if qdrant_state == "up":

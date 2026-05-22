@@ -1,0 +1,77 @@
+{
+  "family": "rag-api-service",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::053849129634:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::053849129634:role/rag-api-service-task-role",
+  "containerDefinitions": [
+    {
+      "name": "rag-api-service",
+      "image": "053849129634.dkr.ecr.ap-south-1.amazonaws.com/rag-api-service:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "hostPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "APP_ENV", "value": "prod" },
+        { "name": "HOST", "value": "0.0.0.0" },
+        { "name": "PORT", "value": "8000" },
+        { "name": "ENABLE_ASYNC_INGESTION", "value": "true" },
+        { "name": "AUTO_START_ASYNC_WORKER", "value": "false" },
+        { "name": "ASYNC_WAIT_FOR_COMPLETION_DEFAULT", "value": "false" },
+        { "name": "ENABLE_S3_UPLOAD", "value": "true" },
+        { "name": "AWS_REGION", "value": "ap-south-1" },
+        { "name": "S3_BUCKET_NAME", "value": "aws-rag-demos" },
+        { "name": "S3_KEY_PREFIX", "value": "ingestion/raw" },
+        { "name": "SQS_QUEUE_URL", "value": "https://sqs.ap-south-1.amazonaws.com/053849129634/aws-rag-demo-q" },
+        { "name": "DYNAMODB_JOBS_TABLE", "value": "aws-rag-demo-table" },
+        { "name": "DYNAMODB_JOB_PK", "value": "jobid" },
+        { "name": "LLM_PROVIDER", "value": "bedrock" },
+        { "name": "EMBEDDING_PROVIDER", "value": "bedrock" },
+        { "name": "BEDROCK_REGION", "value": "ap-south-1" },
+        { "name": "BEDROCK_MODEL_ID", "value": "anthropic.claude-3-5-haiku-20241022-v1:0" },
+        { "name": "BEDROCK_EMBEDDING_MODEL_ID", "value": "amazon.titan-embed-text-v2:0" },
+        { "name": "BEDROCK_TEMPERATURE", "value": "0.2" },
+        { "name": "BEDROCK_TOP_P", "value": "0.9" },
+        { "name": "BEDROCK_MAX_TOKENS", "value": "1200" },
+        { "name": "ENABLE_HF_CHUNK_ENRICHMENT", "value": "false" },
+        { "name": "ENABLE_SAGEMAKER_ENRICHMENT", "value": "false" },
+        { "name": "ENABLE_VECTOR_INDEXING", "value": "true" },
+        { "name": "QDRANT_HOST", "value": "732c3e66-00c9-481f-8673-eaac403512b9.eu-west-2-0.aws.cloud.qdrant.io" },
+        { "name": "QDRANT_PORT", "value": "6333" },
+        { "name": "QDRANT_HTTPS", "value": "true" },
+        { "name": "QDRANT_COLLECTION", "value": "rag_chunks" },
+        { "name": "HF_QDRANT_COLLECTION", "value": "rag_chunks_hf" },
+        { "name": "FORCE_HF_RETRIEVAL_COLLECTION", "value": "true" }
+      ],
+      "secrets": [
+        {
+          "name": "QDRANT_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:053849129634:secret:qdrant-api-key:QDRANT_API_KEY::"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()\""],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 20
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/rag-api-service",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
+
